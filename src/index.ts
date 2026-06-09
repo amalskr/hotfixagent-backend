@@ -230,23 +230,23 @@ function buildStatusText(o: StatusOpts): string {
   let headline: string;
   let body: string;
   switch (o.status) {
-    case "pr_opened":
-      headline = "✅ HotFixAgent — pull request ready for review";
-      body = o.prUrl ? `<${o.prUrl}|Review and merge the PR>` : "A pull request was opened.";
-      break;
-    case "draft":
-      headline = "📝 HotFixAgent — DRAFT PR opened · needs human attention";
-      body =
+  case "pr_opened":
+    headline = "✅ HotFixAgent — pull request ready for review";
+    body = o.prUrl ? `<${o.prUrl}|Review and merge the PR>` : "A pull request was opened.";
+    break;
+  case "draft":
+    headline = "📝 HotFixAgent — DRAFT PR opened · needs human attention";
+    body =
         (o.prUrl ? `<${o.prUrl}|Review the draft>` : "A draft PR was opened.") +
         (o.summary ? `\n_${o.summary}_` : "");
-      break;
-    case "failed":
-    default:
-      headline = "❗ HotFixAgent — could not fix automatically · needs human attention";
-      body =
+    break;
+  case "failed":
+  default:
+    headline = "❗ HotFixAgent — could not fix automatically · needs human attention";
+    body =
         (o.summary ? `_${o.summary}_\n` : "") +
         `<${issueUrl(o.issueId)}|Investigate in Crashlytics>`;
-      break;
+    break;
   }
   return [`*${headline}*`, typeLine, at, body].join("\n");
 }
