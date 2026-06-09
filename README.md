@@ -82,8 +82,16 @@ repo** (`owner/app-repo`), never the backend repo.
 | GitHub secrets: `ANTHROPIC_API_KEY`, `HOTFIX_CALLBACK_URL`, `CALLBACK_TOKEN` | **Mobile app** repo |
 | GitHub variables: `HOTFIX_BRANCH`, `HOTFIX_PR_BASE`, `HOTFIX_TRIGGER_PHRASE` … | **Mobile app** repo |
 
-> The `GITHUB_TOKEN` Firebase secret must have access to the **app** repo (that's
-> the repo `repository_dispatch` targets and where PRs are opened).
+> The `GITHUB_TOKEN` Firebase secret must reach the **app** repo and have:
+> **Contents: R/W** (dispatch), **Pull requests: R/W** (loop-guard PR check),
+> **Actions: R/W**, **Metadata: R**. A fine-grained token scoped to the app repo,
+> or a classic PAT with `repo` + `workflow`, both work. If the logs show
+> `PR check failed (HTTP 403)`, the token is missing **Pull requests** read.
+> Verify with:
+> ```bash
+> curl -H "Authorization: Bearer YOUR_TOKEN" -H "Accept: application/vnd.github+json" >   "https://api.github.com/repos/OWNER/APP_REPO/pulls?state=all&per_page=1"
+> ```
+> (See DEPLOY-CHECKLIST.md → Appendix A for step-by-step token creation.)
 
 ## 3. Prerequisites
 
@@ -98,42 +106,182 @@ repo** (`owner/app-repo`), never the backend repo.
 
 ---
 
-## 4. How to use (first install)
+## 4. How to set up (complete step-by-step)
 
-### Backend (Cloud Functions)
-1. `cd backend && npm install`
-2. Edit **`src/hotfix.config.ts`** — set `appPackages`, `githubRepo`,
-   `firebaseProjectId`, `crashlyticsAppId`, `region`, `targetBranch`.
-3. Set secrets (not in code):
+This is the full first-time setup. Do the **backend** (Cloud Functions) first,
+then the **mobile app repo**. A copy-paste checklist is at the end (§4h).
+
+> Reminder (see §2b): backend `src/*` lives in the **backend repo**; the two
+> workflow files live in the **mobile app repo**. `config.githubRepo` is the
+> **app** repo.
+
+### 4a. Gather the values you'll need
+
+| Value | Where to get it |
+|---|---|
+| `ANTHROPIC_API_KEY` | console.anthropic.com → API keys |
+| `GITHUB_TOKEN` | GitHub token with repo access — see **Appendix A** (needs Pull requests: R/W) |
+| `SLACK_WEBHOOK_URL` | Slack → see step 4f below |
+| `CALLBACK_TOKEN` | generate yourself: `openssl rand -hex 32` |
+| Slack member IDs | Slack profile → ⋮ → "Copy member ID" (for `slackMentionUserIds`) |
+
+### 4b. Set up the Firebase project
+
+1. Create / pick a project at console.firebase.google.com.
+2. **Upgrade to the Blaze (pay-as-you-go) plan** — Crashlytics alert triggers
+   (`onNewFatalIssuePublished` / `onRegressionAlertPublished`) require Blaze.
+3. Add your Android app and make sure **Crashlytics** is enabled and receiving
+   crashes (the app must report at least once).
+4. Install the CLI and log in:
    ```bash
-   firebase functions:secrets:set GITHUB_TOKEN
-   firebase functions:secrets:set SLACK_WEBHOOK_URL
-   firebase functions:secrets:set CALLBACK_TOKEN     # value: openssl rand -hex 32
+   npm install -g firebase-tools
+   firebase login
    ```
-4. Deploy:
+
+### 4c. Configure and install the backend
+
+```bash
+cd backend
+npm install
+firebase use <your-firebase-project-id>     # or set it in .firebaserc
+```
+Edit **`src/hotfix.config.ts`** — the only file you change per app:
+```ts
+appPackages:       ["com.yourcompany.yourapp"],
+githubRepo:        "yourorg/your-app-repo",        // the APP repo (not the backend)
+firebaseProjectId: "your-firebase-project-id",
+crashlyticsAppId:  "android:com.yourcompany.yourapp",
+region:            "asia-southeast1",              // your functions region
+targetBranch:      "main",
+slackMentionUserIds: ["U01ABC2DEF"],               // who to @mention
+dispatchMode:      "all",                          // high-traffic app? start "notify-only"
+```
+
+### 4d. Build (always before deploy)
+
+```bash
+rm -rf lib/        # clean, so stale output can't be redeployed
+npm run build      # tsc — must finish with no errors
+```
+Sanity check the compiled output contains the latest code:
+```bash
+grep -c "parseAlertTitle" lib/index.js     # expect 2 (not 0)
+```
+If it's `0`, the build didn't pick up the new source — re-check `src/` and that
+`npm run build` printed no errors.
+
+### 4e. Set the three Firebase secrets (terminal)
+
+Secrets are **not** stored in code or a `.env` file at runtime — they live in
+Firebase's secret store. Set each with the CLI; it prompts you to paste the value:
+
+```bash
+firebase functions:secrets:set GITHUB_TOKEN        # paste the GitHub token (Appendix A)
+firebase functions:secrets:set SLACK_WEBHOOK_URL   # paste the Slack webhook URL (step 4f)
+firebase functions:secrets:set CALLBACK_TOKEN      # paste: openssl rand -hex 32
+```
+Verify any value later with:
+```bash
+firebase functions:secrets:access CALLBACK_TOKEN
+```
+> Keep the `CALLBACK_TOKEN` value — you set the **same** value as a GitHub secret
+> in step 4g, so the workflow can call back into the function.
+
+### 4f. Get the Slack webhook URL (and where it goes)
+
+The webhook is **where** crash messages are posted; `slackMentionUserIds` is
+**who** gets pinged inside that message.
+
+1. Go to api.slack.com/apps → **Create New App** (or pick an existing one) → *From scratch*.
+2. **Incoming Webhooks** → toggle **On** → **Add New Webhook to Workspace**.
+3. Pick the channel → **Allow** → copy the URL
+   (`https://hooks.slack.com/services/T…/B…/…`).
+4. That URL is your **`SLACK_WEBHOOK_URL`** — you paste it in step 4e
+   (`firebase functions:secrets:set SLACK_WEBHOOK_URL`). It is **not** put in
+   `hotfix.config.ts`; only the secret store holds it.
+
+### 4g. Deploy the functions and grab the callback URL
+
+```bash
+npm run deploy
+# (equivalently: firebase deploy --only functions --force)
+```
+- If it prints `Skipped (No changes detected)` but you changed code, force it:
+  ```bash
+  rm -rf lib/ && npm run build
+  firebase deploy --only functions --force
+  ```
+- From the output, copy the **`hotfixStatusCallback`** URL:
+  ```
+  https://<region>-<project>.cloudfunctions.net/hotfixStatusCallback
+  ```
+  (it may also appear as a `…run.app` URL). This is your `HOTFIX_CALLBACK_URL`.
+
+### 4h. Set up the mobile app repo (GitHub)
+
+1. Copy `.github/workflows/hotfix-agent.yml` and `hotfix-revise.yml` into the
+   **app repo**, commit, and push.
+2. Repo → **Settings → Secrets and variables → Actions → Secrets** → add:
+    - `ANTHROPIC_API_KEY`
+    - `HOTFIX_CALLBACK_URL` = the URL from step 4g
+    - `CALLBACK_TOKEN` = the **same** value you set in Firebase (step 4e)
+3. (Optional) **Variables** tab — override CI defaults:
+   `HOTFIX_BRANCH`, `HOTFIX_PR_BASE`, `HOTFIX_BUILD_CMD`, `HOTFIX_TEST_CMD`,
+   `HOTFIX_JAVA_VERSION`, `HOTFIX_MAX_TURNS`, `HOTFIX_TRIGGER_PHRASE`.
+4. **Settings → Actions → General → Workflow permissions** → enable
+   **Read and write** + **Allow GitHub Actions to create and approve pull requests**.
+5. (Recommended) Add **branch protection** on `main` so nothing auto-merges.
+
+### 4i. Verify end-to-end
+
+1. **Manual run (no crash needed):** app repo → Actions → "HotFix Agent" →
+   *Run workflow* → fill the exception fields → expect a PR + a Slack outcome
+   message in a few minutes (this proves `HOTFIX_CALLBACK_URL` + `CALLBACK_TOKEN`).
+2. **Real crash:** trigger a crash, then **restart the app** (Crashlytics uploads
+   on next launch) → Slack "attempting" → agent → PR → Slack "PR ready".
+3. **Check logs:**
    ```bash
-   npm run deploy
+   firebase functions:log --only hotfixOnFatalCrash | grep "Triage result"
    ```
-   Note the callback URL printed for `hotfixStatusCallback`:
-   `https://<region>-<project>.cloudfunctions.net/hotfixStatusCallback`
+   Expect a real `culprit` and `confidence`. If you see
+   `PR check failed (HTTP 403)`, the `GITHUB_TOKEN` lacks **Pull requests** read
+   (Appendix A).
 
-### Target app repo (GitHub)
-5. Copy `.github/workflows/hotfix-agent.yml` and `hotfix-revise.yml` into the app repo.
-6. Add repo **Secrets** (Settings → Secrets and variables → Actions → Secrets):
-   - `ANTHROPIC_API_KEY`
-   - `HOTFIX_CALLBACK_URL` = the callback URL from step 4
-   - `CALLBACK_TOKEN` = the **same** value you set in Firebase
-7. (Optional) Add repo **Variables** to override CI defaults — see §6.
+### 4j. Release-build note
 
-### Try it
-8. **Manual test:** in the app repo, Actions → "HotFix Agent" → *Run workflow*,
-   fill the exception fields → a PR should appear in a few minutes.
-9. **Real test:** trigger a real crash in the app, let Crashlytics report it →
-   watch Slack for "attempting" then "outcome", and review the PR.
-10. **Revision:** comment the trigger phrase (default `@claude`) on the PR asking
-    for a stricter fix → the agent revises the same branch.
+Enable **R8/ProGuard mapping upload** and keep `-keepattributes SourceFile,LineNumberTable`
+(and do **not** use `-renamesourcefileattribute SourceFile`, or real file names are
+lost). Otherwise release crashes arrive obfuscated. The parser still copes with
+obfuscated frames (`treatObfuscatedFramesAsApp`), but deobfuscation gives better
+locations.
 
----
+### ✅ Setup checklist
+
+Backend (backend repo / Firebase):
+- [ ] Firebase project on **Blaze**, Crashlytics enabled and reporting
+- [ ] `firebase-tools` installed, `firebase login`, `firebase use <project>`
+- [ ] `npm install` in `backend/`
+- [ ] `src/hotfix.config.ts` filled in (packages, repo, project, region, branch, mentions, dispatchMode)
+- [ ] `rm -rf lib/ && npm run build` → no errors → `grep -c parseAlertTitle lib/index.js` = 2
+- [ ] `firebase functions:secrets:set GITHUB_TOKEN` (token from Appendix A, Pull requests R/W)
+- [ ] `firebase functions:secrets:set SLACK_WEBHOOK_URL` (step 4f)
+- [ ] `firebase functions:secrets:set CALLBACK_TOKEN` (`openssl rand -hex 32`)
+- [ ] `npm run deploy` → copy the `hotfixStatusCallback` URL
+
+Mobile app repo (GitHub):
+- [ ] `hotfix-agent.yml` + `hotfix-revise.yml` in `.github/workflows/`
+- [ ] Secret `ANTHROPIC_API_KEY`
+- [ ] Secret `HOTFIX_CALLBACK_URL` (from deploy output)
+- [ ] Secret `CALLBACK_TOKEN` (**same** as Firebase)
+- [ ] (optional) Variables: `HOTFIX_BRANCH`, `HOTFIX_PR_BASE`, …
+- [ ] Actions: Read/write + "create PRs" enabled
+- [ ] Branch protection on `main`
+
+Verify:
+- [ ] Manual workflow run → PR + Slack outcome
+- [ ] Real crash → restart app → Slack "attempting" → PR → "PR ready"
+- [ ] Logs show a real culprit + confidence; no `HTTP 403`
+
 
 ## 5. Deploy to a *new* app — change in TWO single places
 

@@ -343,8 +343,33 @@ async function triggerGitHubWorkflow(
 
 function buildTraceFromAlert(title: string, subtitle: string): string {
   const type = extractType(subtitle);
-  const symbol = title?.trim() || `${config.appPackages[0]}.Unknown.unknown`;
-  return `${type}\n\tat ${symbol}(Unknown Source)`;
+  const { symbol, file } = parseAlertTitle(title);
+  return `${type}\n\tat ${symbol}(${file})`;
+}
+
+/**
+ * Crashlytics issue titles come in a few shapes; pull out the code symbol
+ * (class.method) and, if present, the source file:
+ *   "wq.h0"                          → symbol "wq.h0",            file "Unknown Source"
+ *   "SourceFile - wb.g"              → symbol "wb.g",             file "SourceFile"
+ *   "PriceParser.kt - com.x.Foo.bar" → symbol "com.x.Foo.bar",   file "PriceParser.kt"
+ * The symbol part is whatever looks most like a dotted code path.
+ */
+function parseAlertTitle(title: string): { symbol: string; file: string } {
+  const fallback = `${config.appPackages[0]}.Unknown.unknown`;
+  const t = (title ?? "").trim();
+  if (!t) return { symbol: fallback, file: "Unknown Source" };
+
+  // "<file> - <symbol>"  (Crashlytics often prefixes the source file)
+  const dash = t.split(/\s+-\s+/);
+  if (dash.length === 2) {
+    const [left, right] = dash.map((p) => p.trim());
+    // The code symbol is the side that contains a dot-path / method ref.
+    const symbol = /[.$]/.test(right) ? right : left;
+    const file = symbol === right ? left : right;
+    return { symbol: symbol || fallback, file: file || "Unknown Source" };
+  }
+  return { symbol: t, file: "Unknown Source" };
 }
 
 function extractType(subtitle: string): string {
