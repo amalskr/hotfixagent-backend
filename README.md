@@ -336,6 +336,46 @@ workflows.
 
 ---
 
+**Simple Steps**
+HotFixAgent - Setup
+
+1. Download project and update hotfix.config.ts
+2. Firebase Blaze plan + Crashlytics enabled
+3. Firebase secrets 
+    1. GITHUB_TOKEN, (settings->dev settings -> Fine-grained personal access tokens Contents R/W,PullReq R/W)
+    2. SLACK_WEBHOOK_URL,  (api.slack.com/apps->Create New App → From scratch → name (HotFixAgent) → workspace තෝරන්න → Create->incoming webhook)
+    3. CALLBACK_TOKEN (openssl rand -hex 32)
+        1. CALLBACK_TOKEN = 9d2e54447675ae6bb95100f7347bf4b0329812c255d9155b4709521a3f23ebec
+                         ├─→ Firebase secret CALLBACK_TOKEN  (paste this) 
+                         └─→ GitHub secret  CALLBACK_TOKEN  (paste SAME)
+
+1. In Backend terminal 
+2. firebase use api-project-147253807975
+3. npm install rm -rf lib/ npm run build
+4. Enable Service Usage API
+5. firebase functions:secrets:set GITHUB_TOKEN
+6. firebase functions:secrets:set SLACK_WEBHOOK_URL
+7. firebase functions:secrets:set CALLBACK_TOKEN
+8. firebase deploy --only functions --force
+    1. fail වුණොත් — Build service account permission check
+    2. console.cloud.google.com → project api-project-147253807975 → IAM & Admin → IAM
+    3. 147253807975-compute@developer.gserviceaccount.com හොයන්න
+    4. මේ roles තියෙන්න ඕන (නැත්නම් add කරන්න):
+    * Cloud Build Service Account (roles/cloudbuild.builds.builder)
+    * Eventarc Service Agent
+9. Retry -> firebase deploy --only functions --force
+10. Output hotfixStatusCallback URL එක copy for HOTFIX_CALLBACK_URL = : https://hotfixstatuscallback-tfgs76zaha-as.a.run.app
+11. Mobile App Git
+    1. Repo add .hotfix-agent.yml and hotfix-revise.yml
+    2. Add secret settings -> secrets and variables -> Actions -> Repository secrets add -> ANTHROPIC_API_KEY,HOTFIX_CALLBACK_URL,CALLBACK_TOKEN
+    3. Enable Workflow permissions settings-> Actions -> General -> Workflow per.. -> enable R/W permission
+
+
+Any changes on backend then,
+rm -rf lib/ && npm run build
+firebase deploy --only functions --force
+---
+
 ## 7. How it works (flow detail)
 
 1. Crashlytics fires `onNewFatalIssuePublished` or `onRegressionAlertPublished`.
