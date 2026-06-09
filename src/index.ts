@@ -66,6 +66,7 @@ async function handleCrash(
     appPackages: config.appPackages,
     autoFixableTypes: config.autoFixableTypes,
     notAutoFixableTypes: config.notAutoFixableTypes,
+    treatObfuscatedFramesAsApp: config.treatObfuscatedFramesAsApp,
   });
   logTriage(id, parsed);
 

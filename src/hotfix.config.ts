@@ -36,6 +36,8 @@ export interface HotFixConfig {
   autoFixableTypes: string[];
   /** LOW-confidence crash types: systemic/environmental. Tune per app. */
   notAutoFixableTypes: string[];
+  /** Treat obfuscated, non-framework frames as app candidates (default true). */
+  treatObfuscatedFramesAsApp: boolean;
 }
 
 export const config: HotFixConfig = {
@@ -67,6 +69,10 @@ export const config: HotFixConfig = {
   //  "notify-only" – never run the agent; Slack only (shadow / observe mode)
   // High-traffic app? Start "notify-only" (observe volume), then "auto-only".
   dispatchMode: "all",
+
+  // Production apps are minified; if R8/ProGuard mapping deobfuscation is missing,
+  // still treat obfuscated non-framework frames (e.g. "wq.h0") as app candidates.
+  treatObfuscatedFramesAsApp: true,
 
   // Confidence taxonomy. Add a type to autoFixableTypes once you confirm it is
   // reliably fixable on real crashes for THIS app.
