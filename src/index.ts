@@ -1,17 +1,19 @@
 /**
- * index.ts — HotFixAgent
+ * index.ts — HotFixAgent Cloud Functions.
+ *
+ * App-specific settings live in ONE place: ./hotfix.config.ts.
+ * This file contains no hard-coded app/repo/project values.
  *
  * Triggers:
- *   - hotfixOnFatalCrash      → fires on a NEW fatal issue (first time seen)
- *   - hotfixOnRegression      → fires when a CLOSED issue crashes again
- *   - hotfixStatusCallback    → HTTP endpoint the workflow calls AFTER the agent
- *                               runs, to post a second Slack message with the
- *                               PR outcome (opened / draft / could-not-fix).
+ *   - hotfixOnFatalCrash    → new fatal Crashlytics issue (first time seen)
+ *   - hotfixOnRegression    → a resolved issue crashes again
+ *   - hotfixStatusCallback  → HTTP endpoint the workflow calls after the agent
+ *                             runs, to post a 2nd Slack message with the PR
+ *                             outcome (opened / draft / could-not-fix).
  *
- * Design note: triage no longer GATES the agent. Every crash is attempted once.
- * Triage instead produces a CONFIDENCE label ("auto" vs "needs_human") that is
- * shown in Slack so reviewers know which PRs to scrutinise. A human still
- * reviews and merges every PR.
+ * Design: triage does NOT gate the agent. Every crash is attempted once. Triage
+ * produces a CONFIDENCE label ("auto" vs "needs_human") shown in Slack so
+ * reviewers know which PRs to scrutinise. A human reviews and merges every PR.
  */
 
 import {
@@ -22,19 +24,16 @@ import { onRequest } from "firebase-functions/v2/https";
 import * as logger from "firebase-functions/logger";
 import { defineSecret } from "firebase-functions/params";
 import { parseStackTrace, type ParsedStackTrace } from "./stackTraceParser";
-
-const APP_PACKAGES = ["com.ceylonapz.hotfixagent"];
-const GITHUB_REPO = "amalskr/HotfixAgent";
-const PROJECT_ID = "hotfixagent";
-const ANDROID_APP = "android:com.ceylonapz.hotfixagent";
+import { evaluate as guardEvaluate } from "./githubGuard";
+import { config } from "./hotfix.config";
 
 const githubToken = defineSecret("GITHUB_TOKEN");
 const slackWebhook = defineSecret("SLACK_WEBHOOK_URL");
 const callbackToken = defineSecret("CALLBACK_TOKEN");
 
 const opts = {
-  region: "asia-southeast1",
-  memory: "512MiB" as const,
+  region: config.region,
+  memory: config.functionMemory,
   retry: false,
   secrets: [githubToken, slackWebhook],
 };
@@ -47,7 +46,7 @@ export const hotfixOnFatalCrash = onNewFatalIssuePublished(opts, async (event) =
   await handleCrash(i.id, i.title, i.subtitle, i.appVersion, "new");
 });
 
-// A previously CLOSED issue started crashing again.
+// A previously resolved issue started crashing again.
 export const hotfixOnRegression = onRegressionAlertPublished(opts, async (event) => {
   const i = event.data.payload.issue;
   await handleCrash(i.id, i.title, i.subtitle, i.appVersion, "regression");
@@ -64,12 +63,13 @@ async function handleCrash(
   logger.info("Crash alert received", { issueId: id, title, subtitle, origin });
 
   const parsed = parseStackTrace(buildTraceFromAlert(title, subtitle), {
-    appPackages: APP_PACKAGES,
+    appPackages: config.appPackages,
+    autoFixableTypes: config.autoFixableTypes,
+    notAutoFixableTypes: config.notAutoFixableTypes,
   });
   logTriage(id, parsed);
 
   const culprit = parsed.culpritFrame;
-  // Triage is now a CONFIDENCE signal, not a gate.
   const confidence: Confidence = parsed.isLikelyAutoFixable ? "auto" : "needs_human";
 
   const common = {
@@ -81,16 +81,87 @@ async function handleCrash(
     targetMethod: culprit?.methodName ?? "unknown",
   };
 
-  // 1) Tell Slack we're attempting (with the confidence label + reason).
-  await notifySlack(slackWebhook.value(), {
-    ...common,
-    confidence,
-    reason: parsed.triageReason,
-  });
+  // Deterministic branch name: agent/<exception>-<method>-<issueId>.
+  // Computed here (one source) so the loop guard, workflow, agent and status
+  // step all reference the exact same branch.
+  const branchName = buildBranchName(id, common.exceptionType, common.targetMethod);
 
-  // 2) ALWAYS dispatch — the agent attempts every crash, once.
-  logger.info("Dispatching fix attempt", { issueId: id, confidence });
-  await triggerGitHubWorkflow({ ...common, appVersion, confidence }, githubToken.value());
+  // Loop guard (GitHub-native): suppress duplicates, cap repeated attempts.
+  const guard = await guardEvaluate(branchName, githubToken.value(), config.maxAttemptsPerIssue);
+  logger.info("Loop-guard decision", { issueId: id, ...guard });
+
+  // Duplicate of an active issue → no Slack, no agent run.
+  if (!guard.shouldNotify && !guard.shouldDispatch) {
+    logger.info("Suppressed duplicate", { issueId: id, reason: guard.reason });
+    return;
+  }
+
+  // Cap reached → notify once that it keeps recurring; do NOT dispatch.
+  if (guard.capReached) {
+    await postSlack(
+      slackWebhook.value(),
+      withMentions(
+        [
+          `*❗ HotFixAgent — crash keeps recurring after ${guard.attempts} attempts · needs a human*`,
+          `*${common.exceptionType}*${common.message ? ` — ${common.message}` : ""}`,
+          `at \`${common.targetClass}.${common.targetMethod}\``,
+          `<${issueUrl(id)}|Investigate in Crashlytics>`,
+        ].join("\n"),
+      ),
+    );
+    return;
+  }
+
+  // Dispatch policy (cost/noise control): may downgrade dispatch to notify-only.
+  let willDispatch = guard.shouldDispatch;
+  if (config.dispatchMode === "notify-only") {
+    willDispatch = false;
+  } else if (config.dispatchMode === "auto-only" && confidence === "needs_human") {
+    willDispatch = false;
+  }
+
+  // 1) One Slack message (de-duplicated by the guard), mentions devs.
+  if (guard.shouldNotify) {
+    await notifySlack(slackWebhook.value(), {
+      ...common,
+      confidence,
+      reason: parsed.triageReason,
+      willAttempt: willDispatch,
+    });
+  }
+
+  // 2) Dispatch the agent — once per active issue, if policy allows.
+  if (willDispatch) {
+    logger.info("Dispatching fix attempt", { issueId: id, confidence, attempt: guard.attempts });
+    await triggerGitHubWorkflow({ ...common, appVersion, confidence, branchName }, githubToken.value());
+  } else {
+    logger.info("Not dispatching (policy)", { issueId: id, mode: config.dispatchMode, confidence });
+  }
+}
+
+/** Prefix Slack member mentions (from config) to a message, if any. */
+function withMentions(text: string): string {
+  const ids = config.slackMentionUserIds ?? [];
+  if (ids.length === 0) return text;
+  const mentions = ids.map((u: string) => `<@${u}>`).join(" ");
+  return `${mentions}\n${text}`;
+}
+
+/** kebab-case, alphanumerics only, trimmed to a sane length. */
+function slugify(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "").slice(0, 40);
+}
+
+/**
+ * Deterministic hotfix branch name: agent/<exception>-<method>-<issueId>.
+ * Deterministic (not agent-invented) so the loop guard can find the PR by head.
+ * e.g. NullPointerException in getName → "agent/nullpointer-getname-a3f8b2c1".
+ */
+function buildBranchName(issueId: string, exceptionType: string, method: string): string {
+  const simple = exceptionType.slice(exceptionType.lastIndexOf(".") + 1);
+  const exc = simple.replace(/(exception|error)$/i, ""); // drop noisy suffix
+  const slug = slugify(`${exc}-${method}`) || "crash";
+  return `agent/${slug}-${issueId}`;
 }
 
 /* ───────────────────────── Slack ───────────────────────── */
@@ -104,18 +175,28 @@ interface SlackOpts {
   targetMethod: string;
   confidence: Confidence;
   reason?: string;
+  /** Whether the agent will actually run (false in observe / auto-only modes). */
+  willAttempt: boolean;
 }
 
-/** Initial "attempting a fix" notification. */
+/** Crash notification (attempting, or observe-only depending on policy). */
 async function notifySlack(webhookUrl: string, o: SlackOpts): Promise<void> {
   const tag = o.origin === "regression" ? " (regression)" : "";
   const auto = o.confidence === "auto";
-  const headline = auto
-    ? `🤖 HotFixAgent — auto-fixing a crash${tag}`
-    : `🟠 HotFixAgent — attempting a fix; human attention recommended${tag}`;
-  const outcome = auto
-    ? "Attempting a fix and opening a pull request against `main`…"
-    : `Attempting a fix (low confidence). Flagged for human attention: ${o.reason ?? "uncertain root cause"}`;
+
+  let headline: string;
+  let outcome: string;
+  if (!o.willAttempt) {
+    // Observe / auto-only: we are NOT running the agent, just flagging for a human.
+    headline = `👀 HotFixAgent — crash logged · needs human attention${tag}`;
+    outcome = `Not auto-attempting (policy / low confidence): ${o.reason ?? "flagged for review"}`;
+  } else if (auto) {
+    headline = `🤖 HotFixAgent — auto-fixing a crash${tag}`;
+    outcome = `Attempting a fix and opening a pull request against \`${config.targetBranch}\`…`;
+  } else {
+    headline = `🟠 HotFixAgent — attempting a fix; human attention recommended${tag}`;
+    outcome = `Attempting a fix (low confidence). Flagged for human attention: ${o.reason ?? "uncertain root cause"}`;
+  }
 
   const text = [
     `*${headline}*`,
@@ -125,7 +206,7 @@ async function notifySlack(webhookUrl: string, o: SlackOpts): Promise<void> {
     `<${issueUrl(o.issueId)}|View in Crashlytics>`,
   ].join("\n");
 
-  await postSlack(webhookUrl, text);
+  await postSlack(webhookUrl, withMentions(text));
 }
 
 /* ──────────────── PR-status callback (second message) ──────────────── */
@@ -149,23 +230,23 @@ function buildStatusText(o: StatusOpts): string {
   let headline: string;
   let body: string;
   switch (o.status) {
-  case "pr_opened":
-    headline = "✅ HotFixAgent — pull request ready for review";
-    body = o.prUrl ? `<${o.prUrl}|Review and merge the PR>` : "A pull request was opened.";
-    break;
-  case "draft":
-    headline = "📝 HotFixAgent — DRAFT PR opened · needs human attention";
-    body =
+    case "pr_opened":
+      headline = "✅ HotFixAgent — pull request ready for review";
+      body = o.prUrl ? `<${o.prUrl}|Review and merge the PR>` : "A pull request was opened.";
+      break;
+    case "draft":
+      headline = "📝 HotFixAgent — DRAFT PR opened · needs human attention";
+      body =
         (o.prUrl ? `<${o.prUrl}|Review the draft>` : "A draft PR was opened.") +
         (o.summary ? `\n_${o.summary}_` : "");
-    break;
-  case "failed":
-  default:
-    headline = "❗ HotFixAgent — could not fix automatically · needs human attention";
-    body =
+      break;
+    case "failed":
+    default:
+      headline = "❗ HotFixAgent — could not fix automatically · needs human attention";
+      body =
         (o.summary ? `_${o.summary}_\n` : "") +
         `<${issueUrl(o.issueId)}|Investigate in Crashlytics>`;
-    break;
+      break;
   }
   return [`*${headline}*`, typeLine, at, body].join("\n");
 }
@@ -177,7 +258,7 @@ function buildStatusText(o: StatusOpts): string {
  *     prUrl?, exceptionType?, targetClass?, targetMethod?, summary? }
  */
 export const hotfixStatusCallback = onRequest(
-  { region: "asia-southeast1", secrets: [slackWebhook, callbackToken] },
+  { region: config.region, secrets: [slackWebhook, callbackToken] },
   async (req, res) => {
     if (req.method !== "POST") {
       res.status(405).send("method not allowed");
@@ -195,18 +276,18 @@ export const hotfixStatusCallback = onRequest(
       return;
     }
 
-    await postSlack(slackWebhook.value(), buildStatusText(b as StatusOpts));
+    await postSlack(slackWebhook.value(), withMentions(buildStatusText(b as StatusOpts)));
     logger.info("Status callback posted to Slack", { issueId: b.issueId, status: b.status });
     res.status(200).send("ok");
   },
 );
 
-/* ──────────────────── shared Slack sender ──────────────────── */
+/* ──────────────────── shared helpers ──────────────────── */
 
 function issueUrl(issueId: string): string {
   return (
-    `https://console.firebase.google.com/project/${PROJECT_ID}` +
-    `/crashlytics/app/${ANDROID_APP}/issues/${issueId}`
+    `https://console.firebase.google.com/project/${config.firebaseProjectId}` +
+    `/crashlytics/app/${config.crashlyticsAppId}/issues/${issueId}`
   );
 }
 
@@ -237,14 +318,12 @@ async function postSlack(webhookUrl: string, text: string): Promise<void> {
   logger.error("Slack post failed after 3 attempts");
 }
 
-/* ──────────────────── GitHub dispatch ──────────────────── */
-
 /** Fire a repository_dispatch so the hotfix-agent workflow runs. */
 async function triggerGitHubWorkflow(
   payload: Record<string, unknown>,
   token: string,
 ): Promise<void> {
-  const res = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/dispatches`, {
+  const res = await fetch(`https://api.github.com/repos/${config.githubRepo}/dispatches`, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${token}`,
@@ -252,23 +331,18 @@ async function triggerGitHubWorkflow(
       "X-GitHub-Api-Version": "2022-11-28",
       "User-Agent": "HotFixAgent",
     },
-    body: JSON.stringify({ event_type: "hotfix-crash", client_payload: payload }),
+    body: JSON.stringify({ event_type: config.dispatchEventType, client_payload: payload }),
   });
   if (!res.ok) {
-    logger.error("repository_dispatch failed", {
-      status: res.status,
-      body: await res.text(),
-    });
+    logger.error("repository_dispatch failed", { status: res.status, body: await res.text() });
     return;
   }
   logger.info("repository_dispatch sent to GitHub", { issueId: payload.issueId });
 }
 
-/* ──────────────────── helpers ──────────────────── */
-
 function buildTraceFromAlert(title: string, subtitle: string): string {
   const type = extractType(subtitle);
-  const symbol = title?.trim() || `${APP_PACKAGES[0]}.Unknown.unknown`;
+  const symbol = title?.trim() || `${config.appPackages[0]}.Unknown.unknown`;
   return `${type}\n\tat ${symbol}(Unknown Source)`;
 }
 
