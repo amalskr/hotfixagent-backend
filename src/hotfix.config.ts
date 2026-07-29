@@ -68,7 +68,10 @@ export const config: HotFixConfig = {
   //  "auto-only"   – attempt only HIGH-confidence; needs_human = notify only
   //  "notify-only" – never run the agent; Slack only (shadow / observe mode)
   // High-traffic app? Start "notify-only" (observe volume), then "auto-only".
-  dispatchMode: "all",
+  // Cost control: only HIGH-confidence crashes reach the agent. A needs_human
+  // crash costs a full agent run (~$1.50 measured) to produce a "could not fix"
+  // message, so those are Slack-only now.
+  dispatchMode: "auto-only",
 
   // Production apps are minified; if R8/ProGuard mapping deobfuscation is missing,
   // still treat obfuscated non-framework frames (e.g. "wq.h0") as app candidates.
