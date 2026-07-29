@@ -40,7 +40,7 @@ Key design choices:
 | `backend/src/index.ts` | Firebase Cloud Functions | 3 functions: `hotfixOnFatalCrash`, `hotfixOnRegression`, `hotfixStatusCallback` |
 | `backend/src/stackTraceParser.ts` | (pure logic) | parse trace → culprit frame + confidence label |
 | `backend/src/hotfix.config.ts` | **single source of truth** | all app-specific backend settings |
-| `.github/workflows/hotfix-agent.yml` | target app repo | runs the LLM agent (Claude, Gemini fallback), opens PR, calls status callback |
+| `.github/workflows/hotfix-agent.yml` | target app repo | runs the LLM agent (Claude, or Gemini if switched), opens PR, calls status callback |
 | `.github/workflows/hotfix-revise.yml` | target app repo | reviewer-driven revision via PR mention |
 | `.github/app-workflows/` | **this** repo | template copies of the two workflows above — edit here, copy to the app repo |
 
@@ -98,10 +98,9 @@ repo** (`owner/app-repo`), never the backend repo.
 
 - An Android app using **Firebase Crashlytics** (Blaze plan — Crashlytics alert
   triggers need it), with the app source in a **GitHub** repo.
-- **Anthropic API key** and/or a **Gemini API key** (Claude runs the agent;
-  Gemini takes over when the Anthropic API is over quota — see §7c), a **GitHub
-  token** (repo + workflow scope), and a **Slack incoming webhook** (optional but
-  recommended).
+- **Anthropic API key** (Claude runs the agent), optionally a **Gemini API key**
+  if you want to switch the LLM to Gemini (§7c), a **GitHub token** (repo +
+  workflow scope), and a **Slack incoming webhook** (optional but recommended).
 - `firebase-tools` and Node 22 locally.
 - **Release-build note:** enable R8/ProGuard **mapping file upload** and retain
   source/line attributes, or release crashes arrive obfuscated and the agent
@@ -123,7 +122,7 @@ then the **mobile app repo**. A copy-paste checklist is at the end (§4h).
 | Value | Where to get it |
 |---|---|
 | `ANTHROPIC_API_KEY` | console.anthropic.com → API keys |
-| `GEMINI_API_KEY` | aistudio.google.com → Get API key (fallback LLM; optional but recommended) |
+| `GEMINI_API_KEY` | aistudio.google.com → Get API key (only needed if you switch to Gemini) |
 | `GITHUB_TOKEN` | GitHub token with repo access — see **Appendix A** (needs Pull requests: R/W) |
 | `SLACK_WEBHOOK_URL` | Slack → see step 4f below |
 | `CALLBACK_TOKEN` | generate yourself: `openssl rand -hex 32` |
@@ -227,7 +226,7 @@ npm run deploy
    **app repo**, commit, and push.
 2. Repo → **Settings → Secrets and variables → Actions → Secrets** → add:
     - `ANTHROPIC_API_KEY` (primary LLM)
-    - `GEMINI_API_KEY` (fallback LLM, used when Claude is over quota — see §7c)
+    - `GEMINI_API_KEY` (only needed if you switch the LLM to Gemini — see §7c)
     - `HOTFIX_CALLBACK_URL` = the URL from step 4g
     - `CALLBACK_TOKEN` = the **same** value you set in Firebase (step 4e)
 3. (Optional) **Variables** tab — override CI defaults:
@@ -279,7 +278,7 @@ Backend (backend repo / Firebase):
 Mobile app repo (GitHub):
 - [ ] `hotfix-agent.yml` + `hotfix-revise.yml` in `.github/workflows/`
 - [ ] Secret `ANTHROPIC_API_KEY`
-- [ ] Secret `GEMINI_API_KEY` (fallback when Claude is over quota)
+- [ ] Secret `GEMINI_API_KEY` (only if you switch the LLM to Gemini)
 - [ ] Secret `HOTFIX_CALLBACK_URL` (from deploy output)
 - [ ] Secret `CALLBACK_TOKEN` (**same** as Firebase)
 - [ ] (optional) Variables: `HOTFIX_BRANCH`, `HOTFIX_PR_BASE`, …
@@ -318,11 +317,10 @@ Settings → Secrets and variables → Actions → **Variables**:
 | `HOTFIX_BUILD_CMD` | `./gradlew assembleDebug` | build command |
 | `HOTFIX_TEST_CMD` | `./gradlew testDebugUnitTest` | test command |
 | `HOTFIX_JAVA_VERSION` | `17` | JDK version |
-| `HOTFIX_MAX_TURNS` | `40` | agent iteration budget (cost control; both LLMs) |
+| `HOTFIX_MAX_TURNS` | `40` | agent iteration budget (cost control; either LLM) |
 | `HOTFIX_TRIGGER_PHRASE` | `@claude` | mention that triggers a PR revision |
-| `HOTFIX_LLM` | `auto` | default provider for manual runs / PR revisions: `auto`, `claude`, `gemini` |
+| `HOTFIX_LLM` | `claude` | which LLM runs the agent: `claude` or `gemini` |
 | `HOTFIX_GEMINI_MODEL` | Gemini CLI default | pin the Gemini model, e.g. `gemini-3.1-pro-preview` |
-| `HOTFIX_PROBE_MODEL` | `claude-haiku-4-5-20251001` | cheap model for the Anthropic quota pre-check |
 
 Plus the new repo's **Secrets**: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
 `HOTFIX_CALLBACK_URL`, `CALLBACK_TOKEN`. That's it — no source edits in
@@ -337,7 +335,7 @@ Plus the new repo's **Secrets**: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
 
 **Backend (`hotfix.config.ts`)** — `appPackages`, `githubRepo`, `firebaseProjectId`,
 `crashlyticsAppId`, `region`, `targetBranch`, `dispatchEventType`, `functionMemory`,
-`llmProvider`, `autoFixableTypes`, `notAutoFixableTypes`.
+`autoFixableTypes`, `notAutoFixableTypes`.
 
 **CI (repo Variables)** — see the table in §5B.
 
@@ -439,78 +437,42 @@ avoids re-running (and re-paying for) the agent on an issue already in flight.
 > configure. The Cloud Function makes no LLM calls, so it has no token cost. The
 > loop guard above is the real saving.
 
-## 7c. LLM providers — Claude primary, Gemini fallback
+## 7c. Switching the LLM (Claude ⇄ Gemini)
 
-An over-quota Anthropic API used to mean a dead workflow run and a
-"could-not-fix" Slack message. Both workflows now switch to **Gemini** instead.
+The agent runs on **Claude** exactly as it always has. Gemini is an alternative
+you select manually — there is no automatic switching, no API pre-check, and no
+failover. One provider runs per run; if it fails, the run fails, same as before.
 
-**Pinned or auto.** Pinning a provider is the simple, predictable mode: that LLM
-runs every time, with no pre-check and no switching. `auto` is the resilient
-mode. Resolution order, first match wins:
-
-| Source | Applies to |
+| To switch | Do this |
 |---|---|
-| `client_payload.llm` ← `llmProvider` in `hotfix.config.ts` | crash-triggered runs |
-| the **LLM provider** input on a manual run | that one run |
-| `HOTFIX_LLM` repo variable | manual runs left on `default`, and PR revisions |
-| `auto` | nothing set anywhere |
+| All runs (incl. crash-triggered) | set repo variable `HOTFIX_LLM` to `gemini` (back to `claude` to undo) |
+| One manual run | Actions → HotFix Agent → *Run workflow* → **LLM** = `gemini` |
+| One PR revision | write `llm=gemini` in the `@claude` comment |
 
-A reviewer can also pin one revision by writing `llm=gemini` (or `llm=claude` /
-`llm=auto`) in the PR comment.
+Nothing in the backend decides the provider — it is purely a CI-side choice, so
+switching needs no redeploy. Requires the `GEMINI_API_KEY` secret in the app repo.
 
-When a provider is **pinned**, a missing API key fails the run with a clear error
-rather than quietly switching — pinned means pinned. When the mode is **`auto`**,
-every run decides the provider before starting:
+Gemini runs via `google-github-actions/run-gemini-cli@v0`. Two details matter:
 
-1. **Pre-check** — a 1-token request to the Anthropic Messages API.
-   `429` (rate limited), `529` (overloaded), a `credit balance too low` error, or
-   `401`/`403` (key rejected) → **run on Gemini**. Anything inconclusive (network
-   blip, unexpected status) keeps Claude, so a flaky probe can't misroute a run.
-2. **Run** — Claude via `anthropics/claude-code-action@v1`, or Gemini via
-   `google-github-actions/run-gemini-cli@v0`.
-3. **Mid-run fallback, both directions** — if the chosen provider fails *without*
-   opening a PR or pushing the branch, the crash is retried once on the other
-   one. Claude → Gemini needs no extra check. Gemini → Claude re-runs the
-   pre-check first and only proceeds on a healthy `200`, because in auto mode
-   Gemini was picked precisely *because* Claude was exhausted — a blind retry
-   would just burn a second run. Either way, if the first agent already pushed,
-   no retry happens: a second agent must not build on a half-finished fix. A run
-   never bounces more than once.
-4. **No silent green** — the agent steps are `continue-on-error` so the fallback
-   chain and the Slack callback always get their turn. A final guard fails the
-   run if no PR exists at the end, so "every provider failed" can't read as
-   success in the Actions list.
+- `GEMINI_CLI_TRUST_WORKSPACE: "true"` is **required**. A CI checkout is never a
+  "trusted folder", and without it the CLI silently downgrades `--yolo` to
+  interactive approval and exits 1 after ~2s.
+- The Gemini CLI has no built-in git/PR plumbing (claude-code-action does), so its
+  prompt spells out the `git` + `gh pr create` steps.
 
-Both providers get the **same prompt**, composed once per run into
-`$GITHUB_ENV`, so they cannot drift apart. Gemini gets extra `git` + `gh`
-instructions because the Gemini CLI has no built-in PR plumbing. Its turn budget
-is the same `HOTFIX_MAX_TURNS`, and its tool access is restricted to
-file/search/shell tools. The Slack outcome message names the provider that ran.
-
-Both fallback directions are disabled while a provider is pinned — see the table
-above for where to set it.
-
-With only one key configured, that provider is always used — omit
-`ANTHROPIC_API_KEY` to run Gemini-only, or `GEMINI_API_KEY` for the old
-Claude-only behaviour. Neither key set fails the run with a clear error.
-
-> **A free-tier Gemini key cannot run this agent.** Measured on a real run:
+> **A free-tier Gemini key cannot finish a run.** Measured:
 > ```
 > Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests,
 > limit: 20, model: gemini-3.5-flash
 > ```
-> **20 requests per day.** A single repair run spends that inside its first few
-> turns of reading files, so the run dies with
-> `TerminalQuotaError: You have exhausted your daily quota`. Changing model does
-> not help — Pro models have *tighter* free limits than Flash — and the budget is
-> shared with anything else using the key (e.g. the app repo's `agentTest`
-> plugin). **Enable billing on the key's Google Cloud project**; that is the only
-> thing that makes Gemini usable here, whether as the pinned provider or as a
-> fallback.
+> **20 requests/day** — a repair run spends that in its first few turns and dies
+> with `TerminalQuotaError`. Changing model does not help (Pro models have
+> *tighter* free limits than Flash), and the budget is shared with anything else
+> using the key. **Enable billing on the key's Google Cloud project** before
+> relying on Gemini.
 >
-> Pin `HOTFIX_GEMINI_MODEL` regardless: left unset, the agent silently follows
-> whatever the Gemini CLI currently defaults to. Note there is **no
-> `gemini-3.5-pro`** — the 3.5 line is Flash-only; the Pro ids are
+> `HOTFIX_GEMINI_MODEL` pins the model; left unset the CLI picks its own default.
+> There is **no `gemini-3.5-pro`** — the 3.5 line is Flash-only; the Pro ids are
 > `gemini-3.1-pro-preview` (newest) and `gemini-2.5-pro` (stable).
 
 ## 8. Safety & cost notes
@@ -520,9 +482,6 @@ Claude-only behaviour. Neither key set fails the run with a clear error.
 - **Cost:** every crash runs the agent. To control spend, tune `HOTFIX_MAX_TURNS`,
   consider skipping the agent for `needs_human` types, and de-duplicate recurring
   crashes (a persistent attempt counter is a known extension).
-- **Fallback cost:** a Claude failure that produced no PR is retried on Gemini, so
-  a failed crash can cost two agent runs. The `HOTFIX_MAX_TURNS` budget applies to
-  each. Set `llmProvider` to pin one provider if you'd rather never double-run.
 - **Secrets** live only in Firebase/GitHub secret stores — never in
   `hotfix.config.ts` and never in the workflow YAML.
 

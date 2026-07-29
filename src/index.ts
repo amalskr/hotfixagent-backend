@@ -133,16 +133,8 @@ async function handleCrash(
 
   // 2) Dispatch the agent — once per active issue, if policy allows.
   if (willDispatch) {
-    logger.info("Dispatching fix attempt", {
-      issueId: id,
-      confidence,
-      attempt: guard.attempts,
-      llm: config.llmProvider,
-    });
-    await triggerGitHubWorkflow(
-      { ...common, appVersion, confidence, branchName, llm: config.llmProvider },
-      githubToken.value(),
-    );
+    logger.info("Dispatching fix attempt", { issueId: id, confidence, attempt: guard.attempts });
+    await triggerGitHubWorkflow({ ...common, appVersion, confidence, branchName }, githubToken.value());
   } else {
     logger.info("Not dispatching (policy)", { issueId: id, mode: config.dispatchMode, confidence });
   }
@@ -241,10 +233,7 @@ function buildStatusText(o: StatusOpts): string {
   switch (o.status) {
   case "pr_opened":
     headline = "✅ HotFixAgent — pull request ready for review";
-    // summary names the LLM that produced the fix (Claude, or the Gemini fallback).
-    body =
-        (o.prUrl ? `<${o.prUrl}|Review and merge the PR>` : "A pull request was opened.") +
-        (o.summary ? `\n_${o.summary}_` : "");
+    body = o.prUrl ? `<${o.prUrl}|Review and merge the PR>` : "A pull request was opened.";
     break;
   case "draft":
     headline = "📝 HotFixAgent — DRAFT PR opened · needs human attention";

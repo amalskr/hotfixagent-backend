@@ -1,16 +1,11 @@
 name: HotFix Revise
 
 # Reviewer drives changes on an open hotfix PR by mentioning the trigger phrase
-# (default @claude) in a PR comment / review. The agent reads the thread + diff
-# and pushes a revision to the SAME PR branch.
+# (default @claude) in a PR comment / review. Claude reads the thread + diff and
+# pushes a revision to the SAME PR branch.
 #
 # To change the mention to e.g. @fixagent, set repo VARIABLE HOTFIX_TRIGGER_PHRASE
 # to "@fixagent". It is used BOTH in the if-guard and the action's trigger_phrase.
-#
-# LLM PROVIDERS: Claude primary, Gemini fallback. If the Anthropic API is out of
-# quota (429 / 529 / "credit balance too low") or the key is rejected, the
-# revision runs on Gemini (GEMINI_API_KEY) instead of failing. A reviewer can
-# force a provider by adding "llm=gemini" or "llm=claude" to the comment.
 on:
   issue_comment:
     types: [created]
@@ -22,11 +17,10 @@ on:
 jobs:
   revise:
     # Only on PRs, only when a HUMAN mentions the trigger phrase. The bot guard
-    # stops the agent from triggering itself (infinite loop).
+    # stops Claude from triggering itself (infinite loop).
     if: |
       github.actor != 'claude[bot]' &&
       github.actor != 'github-actions[bot]' &&
-      github.actor != 'gemini-cli[bot]' &&
       (
         (github.event_name == 'issue_comment' &&
          github.event.issue.pull_request &&
@@ -42,18 +36,11 @@ jobs:
       pull-requests: write
       id-token: write
 
-    # Reviewer text reaches the shell only through env vars, never through
-    # ${{ }} interpolation inside a run block.
+    # A reviewer switches provider for one revision by writing "llm=gemini" in
+    # the comment; otherwise the HOTFIX_LLM repo variable decides.
     env:
-      GH_TOKEN: ${{ github.token }}
-      # Required: a CI checkout is never a "trusted folder", and without this the
-      # Gemini CLI downgrades --yolo to approval mode and exits 1.
-      GEMINI_CLI_TRUST_WORKSPACE: "true"
+      LLM: ${{ contains(format('{0}{1}', github.event.comment.body, github.event.review.body), 'llm=gemini') && 'gemini' || (vars.HOTFIX_LLM || 'claude') }}
       PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
-      REQUEST_BODY: ${{ github.event.comment.body || github.event.review.body }}
-      BUILD_CMD: ${{ vars.HOTFIX_BUILD_CMD || './gradlew assembleDebug' }}
-      TEST_CMD:  ${{ vars.HOTFIX_TEST_CMD  || './gradlew testDebugUnitTest' }}
-      MAX_TURNS: ${{ vars.HOTFIX_MAX_TURNS || '40' }}
 
     steps:
       - name: Checkout
@@ -67,105 +54,8 @@ jobs:
           distribution: temurin
           java-version: ${{ vars.HOTFIX_JAVA_VERSION || '17' }}
 
-      - name: Prepare workspace for the agent
-        run: |
-          set -euo pipefail
-          git config user.name  "hotfix-agent[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          echo '.gemini/' >> .git/info/exclude
-
-      - name: Choose LLM provider
-        id: pick
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          DEFAULT_LLM: ${{ vars.HOTFIX_LLM || 'auto' }}
-          PROBE_MODEL: ${{ vars.HOTFIX_PROBE_MODEL || 'claude-haiku-4-5-20251001' }}
-        run: |
-          set -uo pipefail
-
-          have_claude=false; have_gemini=false
-          if [ -n "${ANTHROPIC_API_KEY:-}" ]; then have_claude=true; fi
-          if [ -n "${GEMINI_API_KEY:-}" ];    then have_gemini=true; fi
-          echo "have_claude=$have_claude" >> "$GITHUB_OUTPUT"
-          echo "have_gemini=$have_gemini" >> "$GITHUB_OUTPUT"
-
-          # Default comes from the HOTFIX_LLM repo variable; a reviewer can pin
-          # per-comment with "llm=gemini" / "llm=claude".
-          requested="${DEFAULT_LLM:-auto}"
-          if printf '%s' "${REQUEST_BODY:-}" | grep -qiE 'llm[[:space:]]*=[[:space:]]*gemini'; then requested=gemini; fi
-          if printf '%s' "${REQUEST_BODY:-}" | grep -qiE 'llm[[:space:]]*=[[:space:]]*claude'; then requested=claude; fi
-          if printf '%s' "${REQUEST_BODY:-}" | grep -qiE 'llm[[:space:]]*=[[:space:]]*auto';   then requested=auto;   fi
-          echo "Requested provider: $requested"
-
-          # Anthropic quota pre-check. Anything inconclusive => keep Claude.
-          probe() {
-            local code body
-            code=$(curl -sS -m 30 -o /tmp/anthropic-probe.json -w '%{http_code}' \
-              https://api.anthropic.com/v1/messages \
-              -H "x-api-key: ${ANTHROPIC_API_KEY}" \
-              -H "anthropic-version: 2023-06-01" \
-              -H "content-type: application/json" \
-              -d "{\"model\":\"${PROBE_MODEL}\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
-              2>/dev/null) || code=000
-            body=$(cat /tmp/anthropic-probe.json 2>/dev/null || true)
-            echo "Anthropic pre-check: HTTP $code" >&2
-            case "$code" in
-              200)     echo ok ;;
-              429|529) echo quota ;;
-              401|403) echo rejected ;;
-              400)
-                if printf '%s' "$body" | grep -qiE 'credit balance|quota|rate.?limit'; then
-                  echo quota
-                else
-                  echo ok
-                fi ;;
-              *) echo unknown ;;
-            esac
-          }
-
-          provider=""; reason=""; strict=false
-          case "$requested" in
-            # PINNED: no pre-check, no cross-provider retry, missing key is fatal.
-            claude)
-              if [ "$have_claude" = false ]; then
-                echo "::error::LLM is pinned to claude but ANTHROPIC_API_KEY is not set."
-                exit 1
-              fi
-              provider=claude; strict=true; reason="pinned to claude (no pre-check, no fallback)" ;;
-            gemini)
-              if [ "$have_gemini" = false ]; then
-                echo "::error::LLM is pinned to gemini but GEMINI_API_KEY is not set."
-                exit 1
-              fi
-              provider=gemini; strict=true; reason="pinned to gemini (no pre-check, no fallback)" ;;
-            *)
-              if   [ "$have_claude" = false ] && [ "$have_gemini" = true ]; then
-                provider=gemini; reason="no ANTHROPIC_API_KEY"
-              elif [ "$have_claude" = true ] && [ "$have_gemini" = false ]; then
-                provider=claude; reason="no GEMINI_API_KEY (no fallback available)"
-              elif [ "$have_claude" = true ] && [ "$have_gemini" = true ]; then
-                case "$(probe)" in
-                  quota)    provider=gemini; reason="Anthropic API over quota / rate limited" ;;
-                  rejected) provider=gemini; reason="Anthropic API key rejected" ;;
-                  ok)       provider=claude; reason="Anthropic API healthy" ;;
-                  *)        provider=claude; reason="Anthropic pre-check inconclusive; trying Claude first" ;;
-                esac
-              else
-                echo "::error::Neither ANTHROPIC_API_KEY nor GEMINI_API_KEY is set."
-                exit 1
-              fi ;;
-          esac
-
-          echo "provider=$provider" >> "$GITHUB_OUTPUT"
-          echo "strict=$strict"     >> "$GITHUB_OUTPUT"
-          echo "::notice::HotFix revise provider: $provider ($reason)"
-          echo "**LLM provider:** \`$provider\` — $reason" >> "$GITHUB_STEP_SUMMARY"
-
       - name: Claude revises the PR
-        id: claude
-        if: steps.pick.outputs.provider == 'claude'
-        continue-on-error: true
+        if: env.LLM != 'gemini'
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -175,75 +65,48 @@ jobs:
             --allowedTools "Read,Edit,Write,Grep,Glob,Bash(./gradlew:*),Bash(git:*),Bash(gh:*)"
             --append-system-prompt "You are revising an existing hotfix PR based on reviewer feedback. Address the request precisely. Never silence a crash with an empty or swallowing try/catch — fix the root cause (validate input, null-safety, correct logic). Keep the change minimal. Build and run the unit tests before pushing. Push to the same PR branch; do not open a new PR."
 
-      - name: Decide Gemini fallback
-        id: fallback
-        if: steps.claude.outcome == 'failure' && steps.pick.outputs.have_gemini == 'true' && steps.pick.outputs.strict != 'true'
-        run: |
-          echo "run=true" >> "$GITHUB_OUTPUT"
-          echo "::warning::Claude revision failed — retrying on Gemini."
-          echo "**Fallback:** Claude failed, retrying on Gemini." >> "$GITHUB_STEP_SUMMARY"
-
-      # claude-code-action checks out the PR branch itself; Gemini CLI does not.
+      # claude-code-action checks out the PR branch itself; the Gemini CLI does not.
       - name: Check out the PR branch for Gemini
-        if: steps.pick.outputs.provider == 'gemini' || steps.fallback.outputs.run == 'true'
+        if: env.LLM == 'gemini'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git reset --hard
-          git clean -fd -e .gemini
+          git config user.name  "hotfix-agent[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo '.gemini/' >> .git/info/exclude
           gh pr checkout "$PR_NUMBER"
-          # Recorded so a later Claude retry can tell whether Gemini pushed
-          # anything before it failed.
-          echo "PR_BRANCH=$(git rev-parse --abbrev-ref HEAD)" >> "$GITHUB_ENV"
-          echo "PR_SHA_BEFORE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-
-      - name: Compose Gemini prompt
-        if: steps.pick.outputs.provider == 'gemini' || steps.fallback.outputs.run == 'true'
-        run: |
-          set -euo pipefail
-          {
-            echo "REVISE_PROMPT<<__HOTFIX_EOF__"
-            cat <<EOF
-          You are revising an existing hotfix pull request in this Android repository
-          based on reviewer feedback. PR number: #$PR_NUMBER. Its branch is already
-          checked out in the working directory.
-
-          The reviewer wrote:
-          ---
-          $REQUEST_BODY
-          ---
-
-          Do the following:
-          1. Read the PR context first:
-               gh pr view $PR_NUMBER --json title,body,headRefName,baseRefName,comments
-               gh pr diff $PR_NUMBER
-          2. Address the reviewer's request precisely. Keep the change minimal and do
-             not refactor unrelated code.
-          3. Build with '$BUILD_CMD' and run '$TEST_CMD'. Iterate until both pass.
-          4. Commit and push to the SAME PR branch (git push). Do NOT open a new PR
-             and never run 'gh pr merge'.
-          5. Reply on the PR with a short summary of what you changed:
-               gh pr comment $PR_NUMBER --body <summary>
-
-          IMPORTANT quality rules:
-          - NEVER silence a crash with an empty or swallowing try/catch — fix the root
-            cause (validate input, null-safety, bounds, correct logic).
-          - NEVER catch kotlinx.coroutines CancellationException / JobCancellationException.
-          - Do not commit .gemini/, build outputs, or unrelated files.
-          - If the request is unclear or you cannot make it pass the build, push nothing
-            and explain the problem in a PR comment instead.
-          EOF
-            echo "__HOTFIX_EOF__"
-          } >> "$GITHUB_ENV"
 
       - name: Gemini revises the PR
-        id: gemini
-        if: steps.pick.outputs.provider == 'gemini' || steps.fallback.outputs.run == 'true'
-        continue-on-error: true
+        if: env.LLM == 'gemini'
         uses: google-github-actions/run-gemini-cli@v0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GEMINI_CLI_TRUST_WORKSPACE: "true"
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           gemini_model: ${{ vars.HOTFIX_GEMINI_MODEL }}
-          prompt: ${{ env.REVISE_PROMPT }}
+          prompt: |
+            You are revising an existing hotfix pull request in this Android repository
+            based on reviewer feedback. PR number: #${{ github.event.issue.number || github.event.pull_request.number }}.
+            Its branch is already checked out in the working directory.
+
+            Read the PR context first:
+              gh pr view ${{ github.event.issue.number || github.event.pull_request.number }} --json title,body,headRefName,baseRefName,comments
+              gh pr diff ${{ github.event.issue.number || github.event.pull_request.number }}
+
+            Address the reviewer's request precisely and keep the change minimal. Build
+            with `${{ vars.HOTFIX_BUILD_CMD || './gradlew assembleDebug' }}` and run
+            `${{ vars.HOTFIX_TEST_CMD || './gradlew testDebugUnitTest' }}`, iterating until
+            both pass. Then commit and push to the SAME PR branch (git push) and reply
+            with a short summary:
+              gh pr comment ${{ github.event.issue.number || github.event.pull_request.number }} --body <summary>
+
+            Never silence a crash with an empty or swallowing try/catch — fix the root
+            cause (validate input, null-safety, bounds, correct logic). Never catch
+            kotlinx.coroutines CancellationException. Do NOT open a new PR, never run
+            'gh pr merge', and do not commit .gemini/ or build outputs. If you cannot
+            make it pass, push nothing and explain the problem in a PR comment.
           settings: |
             {
               "model": { "maxSessionTurns": ${{ vars.HOTFIX_MAX_TURNS || '40' }} },
@@ -254,55 +117,3 @@ jobs:
                 ]
               }
             }
-
-      # Gemini ran and failed (e.g. its own daily quota). Retry on Claude, but
-      # only if Gemini pushed nothing and Claude is healthy right now.
-      - name: Decide Claude fallback
-        id: rfallback
-        if: steps.gemini.outcome == 'failure' && steps.pick.outputs.have_claude == 'true' && steps.fallback.outputs.run != 'true' && steps.pick.outputs.strict != 'true'
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          PROBE_MODEL: ${{ vars.HOTFIX_PROBE_MODEL || 'claude-haiku-4-5-20251001' }}
-        run: |
-          set -uo pipefail
-          git fetch -q origin "$PR_BRANCH" 2>/dev/null || true
-          REMOTE_SHA=$(git rev-parse "origin/$PR_BRANCH" 2>/dev/null || echo "")
-          if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" != "${PR_SHA_BEFORE:-}" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Gemini failed after pushing to $PR_BRANCH — not re-running on Claude."
-            exit 0
-          fi
-          code=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' \
-            https://api.anthropic.com/v1/messages \
-            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "content-type: application/json" \
-            -d "{\"model\":\"${PROBE_MODEL}\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
-            2>/dev/null) || code=000
-          if [ "$code" = "200" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::Gemini revision failed with nothing pushed — retrying on Claude."
-            echo "**Fallback:** Gemini failed, retrying on Claude." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Gemini failed and the Anthropic pre-check returned HTTP $code — no provider left to try."
-          fi
-
-      - name: Reset workspace before Claude retry
-        if: steps.rfallback.outputs.run == 'true'
-        run: |
-          set -euo pipefail
-          git reset --hard
-          git clean -fd -e .gemini
-
-      - name: Claude revises the PR (retry)
-        id: claude_retry
-        if: steps.rfallback.outputs.run == 'true'
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          trigger_phrase: ${{ vars.HOTFIX_TRIGGER_PHRASE || '@claude' }}
-          claude_args: |
-            --max-turns ${{ vars.HOTFIX_MAX_TURNS || '40' }}
-            --allowedTools "Read,Edit,Write,Grep,Glob,Bash(./gradlew:*),Bash(git:*),Bash(gh:*)"
-            --append-system-prompt "You are revising an existing hotfix PR based on reviewer feedback. Address the request precisely. Never silence a crash with an empty or swallowing try/catch — fix the root cause (validate input, null-safety, correct logic). Keep the change minimal. Build and run the unit tests before pushing. Push to the same PR branch; do not open a new PR."
