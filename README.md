@@ -357,7 +357,8 @@ HotFixAgent - Setup
     1. GITHUB_TOKEN, (settings->dev settings -> Fine-grained personal access tokens Contents R/W,PullReq R/W)
     2. SLACK_WEBHOOK_URL,  (api.slack.com/apps->Create New App → From scratch → name (HotFixAgent) → workspace තෝරන්න → Create->incoming webhook)
     3. CALLBACK_TOKEN (openssl rand -hex 32)
-        1. CALLBACK_TOKEN = 9d2e54447675ae6bb95100f7347bf4b0329812c255d9155b4709521a3f23ebec
+        1. CALLBACK_TOKEN = <output of `openssl rand -hex 32`>   ← NEVER paste the real
+                         value here; this repo is public
                          ├─→ Firebase secret CALLBACK_TOKEN  (paste this) 
                          └─→ GitHub secret  CALLBACK_TOKEN  (paste SAME)
 
