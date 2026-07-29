@@ -76,7 +76,7 @@ export const config: HotFixConfig = {
   //  "auto-only"   – attempt only HIGH-confidence; needs_human = notify only
   //  "notify-only" – never run the agent; Slack only (shadow / observe mode)
   // High-traffic app? Start "notify-only" (observe volume), then "auto-only".
-  dispatchMode: "all",
+  dispatchMode: "notify-only",
 
   // ─── LLM provider ───
   // "auto" = Claude first, automatic switch to Gemini when the Anthropic API is
