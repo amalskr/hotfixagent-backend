@@ -11,7 +11,6 @@ on GitHub** — that is what lets the workflow post the outcome back to Slack.
 | Key | Get it from | Stored as |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | console.anthropic.com → API keys | **GitHub** repo secret |
-| `GEMINI_API_KEY` | aistudio.google.com → Get API key | **GitHub** repo secret (only if you switch the LLM to Gemini) |
 | `GITHUB_TOKEN` | GitHub → Settings → Developer settings → Personal access tokens | **Firebase** secret |
 | `SLACK_WEBHOOK_URL` | Slack → your app → Incoming Webhooks | **Firebase** secret |
 | `CALLBACK_TOKEN` | generate: `openssl rand -hex 32` | **BOTH** Firebase secret **and** GitHub repo secret (same value) |
@@ -91,9 +90,7 @@ npm run deploy        # deploys hotfixOnFatalCrash, hotfixOnRegression, hotfixSt
 ### 5b. Add repo Secrets
 Repo → **Settings → Secrets and variables → Actions → Secrets → New repository secret**:
 
-- [ ] `ANTHROPIC_API_KEY` = your Claude API key (default LLM)
-- [ ] `GEMINI_API_KEY` = your Google AI Studio key (only needed if you switch the
-      LLM to Gemini via the HOTFIX_LLM variable or the manual-run dropdown)
+- [ ] `ANTHROPIC_API_KEY` = your Claude API key
 - [ ] `HOTFIX_CALLBACK_URL` = the URL from Part 4
 - [ ] `CALLBACK_TOKEN` = **the exact same value** you set in Firebase (Part 3)
 
@@ -105,10 +102,8 @@ Same page → **Variables** tab. All optional (defaults shown):
 - [ ] `HOTFIX_BUILD_CMD` (default `./gradlew assembleDebug`)
 - [ ] `HOTFIX_TEST_CMD` (default `./gradlew testDebugUnitTest`)
 - [ ] `HOTFIX_JAVA_VERSION` (default `17`)
-- [ ] `HOTFIX_MAX_TURNS` (default `40`) — applies to whichever LLM runs
+- [ ] `HOTFIX_MAX_TURNS` (default `40`)
 - [ ] `HOTFIX_TRIGGER_PHRASE` (default `@claude`; set `@fixagent` to change the mention)
-- [ ] `HOTFIX_LLM` (default `claude`) — set to `gemini` to switch the LLM
-- [ ] `HOTFIX_GEMINI_MODEL` (default: Gemini CLI default; e.g. `gemini-3.1-pro-preview`)
 
 ### 5d. Allow Actions to open PRs
 - [ ] Repo → Settings → Actions → General → Workflow permissions →
@@ -150,8 +145,6 @@ Same page → **Variables** tab. All optional (defaults shown):
 
 | Symptom | Likely cause |
 |---|---|
-| Run used Gemini when you expected Claude (or vice versa) | check the `HOTFIX_LLM` repo variable and the manual-run **LLM** input |
-| Gemini run dies in ~2s | `GEMINI_CLI_TRUST_WORKSPACE` missing from the workflow |
 | Workflow runs but **no Slack outcome** | `HOTFIX_CALLBACK_URL` wrong, or `CALLBACK_TOKEN` differs between Firebase and GitHub |
 | `401 unauthorized` in function logs | `CALLBACK_TOKEN` mismatch |
 | Crash fires but **no workflow** | `GITHUB_TOKEN` scope too low, or `githubRepo` / `dispatchEventType` mismatch (must equal `repository_dispatch: types:`) |
@@ -167,8 +160,8 @@ Check function logs: `firebase functions:log` · Check secret value: `firebase f
 
 ```
 Firebase secrets:   GITHUB_TOKEN · SLACK_WEBHOOK_URL · CALLBACK_TOKEN
-GitHub secrets:     ANTHROPIC_API_KEY · GEMINI_API_KEY · HOTFIX_CALLBACK_URL · CALLBACK_TOKEN(same)
-GitHub variables:   HOTFIX_BRANCH/BUILD_CMD/TEST_CMD/JAVA_VERSION/MAX_TURNS/TRIGGER_PHRASE/LLM/GEMINI_MODEL (optional)
+GitHub secrets:     ANTHROPIC_API_KEY · HOTFIX_CALLBACK_URL · CALLBACK_TOKEN(same)
+GitHub variables:   HOTFIX_BRANCH/BUILD_CMD/TEST_CMD/JAVA_VERSION/MAX_TURNS/TRIGGER_PHRASE (optional)
 Edit per app:       backend/src/hotfix.config.ts  (+ repo Variables)
 Match rule:         CALLBACK_TOKEN identical on Firebase & GitHub
 ```
