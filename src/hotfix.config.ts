@@ -34,10 +34,12 @@ export interface HotFixConfig {
   dispatchMode: "all" | "auto-only" | "notify-only";
   /**
    * Which LLM the repair agent runs on, sent to CI in the dispatch payload.
-   *  "auto"   – Claude, falling back to Gemini when the Anthropic API is out of
-   *             quota / rate limited (the workflow pre-checks before each run)
-   *  "claude" – always Claude
-   *  "gemini" – always Gemini
+   *  "claude" / "gemini" – PINNED: that provider, every time. No API pre-check
+   *             and no cross-provider retry; a missing API key fails the run
+   *             loudly instead of silently switching.
+   *  "auto"   – Claude first, switching to Gemini when the Anthropic API is out
+   *             of quota / rate limited (pre-checked before each run), and
+   *             bouncing back to Claude if Gemini fails without pushing.
    */
   llmProvider: "auto" | "claude" | "gemini";
   /** HIGH-confidence crash types: localised, likely a single-file fix. Tune per app. */
@@ -79,11 +81,11 @@ export const config: HotFixConfig = {
   dispatchMode: "notify-only",
 
   // ─── LLM provider ───
-  // "auto" = Claude first, automatic switch to Gemini when the Anthropic API is
-  // over quota / rate limited. Pin to "gemini" (or "claude") to stop switching.
-  // The CI secrets ANTHROPIC_API_KEY / GEMINI_API_KEY decide what is available;
-  // "auto" with only one key set simply uses that one.
-  llmProvider: "auto",
+  // Pinned to one provider: no pre-check, no switching, predictable runs.
+  // Set "auto" to get Claude-first with automatic Gemini failover instead.
+  // Manual workflow runs default to the app repo's HOTFIX_LLM variable, so keep
+  // the two in step if you want manual runs to match crash-triggered ones.
+  llmProvider: "gemini",
 
   // Production apps are minified; if R8/ProGuard mapping deobfuscation is missing,
   // still treat obfuscated non-framework frames (e.g. "wq.h0") as app candidates.

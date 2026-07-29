@@ -318,7 +318,8 @@ Settings → Secrets and variables → Actions → **Variables**:
 | `HOTFIX_JAVA_VERSION` | `17` | JDK version |
 | `HOTFIX_MAX_TURNS` | `40` | agent iteration budget (cost control; both LLMs) |
 | `HOTFIX_TRIGGER_PHRASE` | `@claude` | mention that triggers a PR revision |
-| `HOTFIX_GEMINI_MODEL` | Gemini CLI default | pin the fallback model, e.g. `gemini-3-pro-preview` |
+| `HOTFIX_LLM` | `auto` | default provider for manual runs / PR revisions: `auto`, `claude`, `gemini` |
+| `HOTFIX_GEMINI_MODEL` | Gemini CLI default | pin the Gemini model, e.g. `gemini-3.1-pro-preview` |
 | `HOTFIX_PROBE_MODEL` | `claude-haiku-4-5-20251001` | cheap model for the Anthropic quota pre-check |
 
 Plus the new repo's **Secrets**: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
@@ -436,7 +437,23 @@ avoids re-running (and re-paying for) the agent on an issue already in flight.
 An over-quota Anthropic API used to mean a dead workflow run and a
 "could-not-fix" Slack message. Both workflows now switch to **Gemini** instead.
 
-Every run decides the provider before starting:
+**Pinned or auto.** Pinning a provider is the simple, predictable mode: that LLM
+runs every time, with no pre-check and no switching. `auto` is the resilient
+mode. Resolution order, first match wins:
+
+| Source | Applies to |
+|---|---|
+| `client_payload.llm` ← `llmProvider` in `hotfix.config.ts` | crash-triggered runs |
+| the **LLM provider** input on a manual run | that one run |
+| `HOTFIX_LLM` repo variable | manual runs left on `default`, and PR revisions |
+| `auto` | nothing set anywhere |
+
+A reviewer can also pin one revision by writing `llm=gemini` (or `llm=claude` /
+`llm=auto`) in the PR comment.
+
+When a provider is **pinned**, a missing API key fails the run with a clear error
+rather than quietly switching — pinned means pinned. When the mode is **`auto`**,
+every run decides the provider before starting:
 
 1. **Pre-check** — a 1-token request to the Anthropic Messages API.
    `429` (rate limited), `529` (overloaded), a `credit balance too low` error, or
@@ -463,25 +480,31 @@ instructions because the Gemini CLI has no built-in PR plumbing. Its turn budget
 is the same `HOTFIX_MAX_TURNS`, and its tool access is restricted to
 file/search/shell tools. The Slack outcome message names the provider that ran.
 
-**Forcing a provider:**
-
-| Scope | How |
-|---|---|
-| All crashes | `llmProvider: "gemini"` (or `"claude"` / `"auto"`) in `src/hotfix.config.ts`, then redeploy |
-| One manual run | Actions → HotFix Agent → *Run workflow* → **LLM provider** |
-| One PR revision | add `llm=gemini` to the `@claude` comment |
+Both fallback directions are disabled while a provider is pinned — see the table
+above for where to set it.
 
 With only one key configured, that provider is always used — omit
 `ANTHROPIC_API_KEY` to run Gemini-only, or `GEMINI_API_KEY` for the old
 Claude-only behaviour. Neither key set fails the run with a clear error.
 
-> **A free-tier Gemini key is a weak fallback.** Google AI Studio's free tier caps
-> requests *per model per day*, and that budget is shared with anything else using
-> the key (e.g. the app repo's `agentTest` plugin). A fallback that can be
-> exhausted at the same moment as Claude isn't really a fallback — enable billing
-> on the key's project for production use. Pin `HOTFIX_GEMINI_MODEL` too: left
-> unset, the fallback silently follows whatever the Gemini CLI currently defaults
-> to, and per-model daily quotas are independent of each other.
+> **A free-tier Gemini key cannot run this agent.** Measured on a real run:
+> ```
+> Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests,
+> limit: 20, model: gemini-3.5-flash
+> ```
+> **20 requests per day.** A single repair run spends that inside its first few
+> turns of reading files, so the run dies with
+> `TerminalQuotaError: You have exhausted your daily quota`. Changing model does
+> not help — Pro models have *tighter* free limits than Flash — and the budget is
+> shared with anything else using the key (e.g. the app repo's `agentTest`
+> plugin). **Enable billing on the key's Google Cloud project**; that is the only
+> thing that makes Gemini usable here, whether as the pinned provider or as a
+> fallback.
+>
+> Pin `HOTFIX_GEMINI_MODEL` regardless: left unset, the agent silently follows
+> whatever the Gemini CLI currently defaults to. Note there is **no
+> `gemini-3.5-pro`** — the 3.5 line is Flash-only; the Pro ids are
+> `gemini-3.1-pro-preview` (newest) and `gemini-2.5-pro` (stable).
 
 ## 8. Safety & cost notes
 

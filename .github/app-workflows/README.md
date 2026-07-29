@@ -35,13 +35,18 @@ run when no PR exists at the end — so "all providers failed" never shows green
 Required app-repo secrets: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (either one may
 be omitted — with only one key set, that provider is always used).
 
-Forcing a provider:
+Setting the provider (first match wins):
 
-| Where | How |
+| Where | Applies to |
 |---|---|
-| Backend (all crashes) | `llmProvider: "gemini"` in `src/hotfix.config.ts` |
-| One manual run | Actions → HotFix Agent → Run workflow → **LLM provider** = `gemini` |
-| One PR revision | include `llm=gemini` in the `@claude` comment |
+| `llmProvider` in the backend's `src/hotfix.config.ts` | crash-triggered runs |
+| Actions → HotFix Agent → Run workflow → **LLM provider** | that one run |
+| `HOTFIX_LLM` repo variable | manual runs left on `default`, and PR revisions |
+| `llm=gemini` in a PR comment | that one revision |
+
+Pinning `claude` or `gemini` means **no pre-check and no cross-provider retry** —
+that LLM every time, and a missing key fails the run instead of switching. Only
+`auto` probes and fails over.
 
 `HOTFIX_GEMINI_MODEL` pins the Gemini model. Worth setting explicitly — left
 unset, the fallback follows whatever the Gemini CLI currently defaults to, and

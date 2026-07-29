@@ -43,11 +43,11 @@ on:
       message:         { description: "Crash message",  required: false, default: "divide by zero" }
       issueId:         { description: "Crashlytics issue id", required: false, default: "manual-test" }
       llm:
-        description: "LLM provider"
+        description: "LLM provider (default = use the HOTFIX_LLM repo variable)"
         required: false
-        default: auto
+        default: default
         type: choice
-        options: [auto, claude, gemini]
+        options: [default, auto, claude, gemini]
 
 # Atomic per-issue guard: only one run per crash issue at a time (a second
 # event for the same issue while one is running will not start a parallel run).
@@ -182,7 +182,10 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          REQUESTED: ${{ github.event.client_payload.llm || github.event.inputs.llm || 'auto' }}
+          # Resolution order: dispatch payload (backend config.llmProvider) →
+          # manual input → HOTFIX_LLM repo variable → auto.
+          REQUESTED: ${{ github.event.client_payload.llm || github.event.inputs.llm || 'default' }}
+          DEFAULT_LLM: ${{ vars.HOTFIX_LLM || 'auto' }}
           PROBE_MODEL: ${{ vars.HOTFIX_PROBE_MODEL || 'claude-haiku-4-5-20251001' }}
         run: |
           set -uo pipefail
@@ -192,6 +195,12 @@ jobs:
           if [ -n "${GEMINI_API_KEY:-}" ];    then have_gemini=true; fi
           echo "have_claude=$have_claude" >> "$GITHUB_OUTPUT"
           echo "have_gemini=$have_gemini" >> "$GITHUB_OUTPUT"
+
+          # "default" (the manual-run default) means "whatever HOTFIX_LLM says".
+          if [ "$REQUESTED" = "default" ] || [ -z "$REQUESTED" ]; then
+            REQUESTED="$DEFAULT_LLM"
+          fi
+          echo "Requested provider: $REQUESTED"
 
           # Anthropic quota pre-check. Anything inconclusive => keep Claude and
           # let the real run decide, so a flaky probe never misroutes.
@@ -220,14 +229,23 @@ jobs:
             esac
           }
 
-          provider=""; reason=""
+          provider=""; reason=""; strict=false
           case "$REQUESTED" in
+            # PINNED: use exactly this provider. No pre-check, no cross-provider
+            # retry, and a missing key is a hard error rather than a silent
+            # switch — pinned means pinned.
             claude)
-              if [ "$have_claude" = true ]; then provider=claude; reason="forced by llm=claude"
-              else provider=gemini; reason="llm=claude requested but ANTHROPIC_API_KEY is not set"; fi ;;
+              if [ "$have_claude" = false ]; then
+                echo "::error::LLM is pinned to claude but ANTHROPIC_API_KEY is not set."
+                exit 1
+              fi
+              provider=claude; strict=true; reason="pinned to claude (no pre-check, no fallback)" ;;
             gemini)
-              if [ "$have_gemini" = true ]; then provider=gemini; reason="forced by llm=gemini"
-              else provider=claude; reason="llm=gemini requested but GEMINI_API_KEY is not set"; fi ;;
+              if [ "$have_gemini" = false ]; then
+                echo "::error::LLM is pinned to gemini but GEMINI_API_KEY is not set."
+                exit 1
+              fi
+              provider=gemini; strict=true; reason="pinned to gemini (no pre-check, no fallback)" ;;
             *)
               if   [ "$have_claude" = false ] && [ "$have_gemini" = true ]; then
                 provider=gemini; reason="no ANTHROPIC_API_KEY"
@@ -248,6 +266,7 @@ jobs:
 
           echo "provider=$provider" >> "$GITHUB_OUTPUT"
           echo "reason=$reason"     >> "$GITHUB_OUTPUT"
+          echo "strict=$strict"     >> "$GITHUB_OUTPUT"
           echo "::notice::HotFix agent provider: $provider ($reason)"
           echo "**LLM provider:** \`$provider\` — $reason" >> "$GITHUB_STEP_SUMMARY"
 
@@ -267,7 +286,7 @@ jobs:
       # otherwise a second agent would work on top of a half-finished fix.
       - name: Decide Gemini fallback
         id: fallback
-        if: steps.claude.outcome == 'failure' && steps.pick.outputs.have_gemini == 'true'
+        if: steps.claude.outcome == 'failure' && steps.pick.outputs.have_gemini == 'true' && steps.pick.outputs.strict != 'true'
         run: |
           set -uo pipefail
           PR_URL=$(gh pr list --head "$BRANCH_NAME" --state all --json url --limit 1 \
@@ -320,7 +339,7 @@ jobs:
       # retry would just burn another run.
       - name: Decide Claude fallback
         id: rfallback
-        if: steps.gemini.outcome == 'failure' && steps.pick.outputs.have_claude == 'true' && steps.fallback.outputs.run != 'true'
+        if: steps.gemini.outcome == 'failure' && steps.pick.outputs.have_claude == 'true' && steps.fallback.outputs.run != 'true' && steps.pick.outputs.strict != 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PROBE_MODEL: ${{ vars.HOTFIX_PROBE_MODEL || 'claude-haiku-4-5-20251001' }}

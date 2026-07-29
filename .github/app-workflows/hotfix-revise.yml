@@ -79,6 +79,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DEFAULT_LLM: ${{ vars.HOTFIX_LLM || 'auto' }}
           PROBE_MODEL: ${{ vars.HOTFIX_PROBE_MODEL || 'claude-haiku-4-5-20251001' }}
         run: |
           set -uo pipefail
@@ -89,10 +90,13 @@ jobs:
           echo "have_claude=$have_claude" >> "$GITHUB_OUTPUT"
           echo "have_gemini=$have_gemini" >> "$GITHUB_OUTPUT"
 
-          # A reviewer can pin the provider in the comment: "llm=gemini".
-          requested=auto
+          # Default comes from the HOTFIX_LLM repo variable; a reviewer can pin
+          # per-comment with "llm=gemini" / "llm=claude".
+          requested="${DEFAULT_LLM:-auto}"
           if printf '%s' "${REQUEST_BODY:-}" | grep -qiE 'llm[[:space:]]*=[[:space:]]*gemini'; then requested=gemini; fi
           if printf '%s' "${REQUEST_BODY:-}" | grep -qiE 'llm[[:space:]]*=[[:space:]]*claude'; then requested=claude; fi
+          if printf '%s' "${REQUEST_BODY:-}" | grep -qiE 'llm[[:space:]]*=[[:space:]]*auto';   then requested=auto;   fi
+          echo "Requested provider: $requested"
 
           # Anthropic quota pre-check. Anything inconclusive => keep Claude.
           probe() {
@@ -120,14 +124,21 @@ jobs:
             esac
           }
 
-          provider=""; reason=""
+          provider=""; reason=""; strict=false
           case "$requested" in
+            # PINNED: no pre-check, no cross-provider retry, missing key is fatal.
             claude)
-              if [ "$have_claude" = true ]; then provider=claude; reason="pinned by reviewer (llm=claude)"
-              else provider=gemini; reason="llm=claude asked for but ANTHROPIC_API_KEY is not set"; fi ;;
+              if [ "$have_claude" = false ]; then
+                echo "::error::LLM is pinned to claude but ANTHROPIC_API_KEY is not set."
+                exit 1
+              fi
+              provider=claude; strict=true; reason="pinned to claude (no pre-check, no fallback)" ;;
             gemini)
-              if [ "$have_gemini" = true ]; then provider=gemini; reason="pinned by reviewer (llm=gemini)"
-              else provider=claude; reason="llm=gemini asked for but GEMINI_API_KEY is not set"; fi ;;
+              if [ "$have_gemini" = false ]; then
+                echo "::error::LLM is pinned to gemini but GEMINI_API_KEY is not set."
+                exit 1
+              fi
+              provider=gemini; strict=true; reason="pinned to gemini (no pre-check, no fallback)" ;;
             *)
               if   [ "$have_claude" = false ] && [ "$have_gemini" = true ]; then
                 provider=gemini; reason="no ANTHROPIC_API_KEY"
@@ -147,6 +158,7 @@ jobs:
           esac
 
           echo "provider=$provider" >> "$GITHUB_OUTPUT"
+          echo "strict=$strict"     >> "$GITHUB_OUTPUT"
           echo "::notice::HotFix revise provider: $provider ($reason)"
           echo "**LLM provider:** \`$provider\` — $reason" >> "$GITHUB_STEP_SUMMARY"
 
@@ -165,7 +177,7 @@ jobs:
 
       - name: Decide Gemini fallback
         id: fallback
-        if: steps.claude.outcome == 'failure' && steps.pick.outputs.have_gemini == 'true'
+        if: steps.claude.outcome == 'failure' && steps.pick.outputs.have_gemini == 'true' && steps.pick.outputs.strict != 'true'
         run: |
           echo "run=true" >> "$GITHUB_OUTPUT"
           echo "::warning::Claude revision failed — retrying on Gemini."
@@ -247,7 +259,7 @@ jobs:
       # only if Gemini pushed nothing and Claude is healthy right now.
       - name: Decide Claude fallback
         id: rfallback
-        if: steps.gemini.outcome == 'failure' && steps.pick.outputs.have_claude == 'true' && steps.fallback.outputs.run != 'true'
+        if: steps.gemini.outcome == 'failure' && steps.pick.outputs.have_claude == 'true' && steps.fallback.outputs.run != 'true' && steps.pick.outputs.strict != 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PROBE_MODEL: ${{ vars.HOTFIX_PROBE_MODEL || 'claude-haiku-4-5-20251001' }}
