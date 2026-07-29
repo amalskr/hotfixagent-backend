@@ -77,6 +77,11 @@ jobs:
           echo '.gemini/' >> .git/info/exclude
           gh pr checkout "$PR_NUMBER"
 
+      # Gemini-only: without ripgrep its search tool falls back to a slow scan.
+      - name: Install ripgrep for Gemini
+        if: env.LLM == 'gemini'
+        run: sudo apt-get install -y -qq ripgrep
+
       - name: Gemini revises the PR
         if: env.LLM == 'gemini'
         uses: google-github-actions/run-gemini-cli@v0
@@ -109,7 +114,7 @@ jobs:
             make it pass, push nothing and explain the problem in a PR comment.
           settings: |
             {
-              "model": { "maxSessionTurns": ${{ vars.HOTFIX_MAX_TURNS || '40' }} },
+              "model": { "maxSessionTurns": ${{ vars.HOTFIX_GEMINI_MAX_TURNS || vars.HOTFIX_MAX_TURNS || '40' }} },
               "tools": {
                 "core": [
                   "read_file", "read_many_files", "write_file", "replace",

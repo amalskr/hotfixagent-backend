@@ -105,6 +105,13 @@ jobs:
             --max-turns ${{ vars.HOTFIX_MAX_TURNS || '40' }}
             --allowedTools "Read,Edit,Write,Grep,Glob,Bash(./gradlew:*),Bash(git:*),Bash(gh:*)"
 
+      # Gemini's search tool falls back to a slow scan without ripgrep, wasting
+      # turns on exactly the work it needs most (locating the blamed method).
+      # claude-code-action ships its own, so this is Gemini-only.
+      - name: Install ripgrep for Gemini
+        if: env.LLM == 'gemini'
+        run: sudo apt-get install -y -qq ripgrep
+
       # Same job, same prompt, Gemini instead of Claude. The Gemini CLI has no
       # built-in git/PR plumbing, so step 4 spells out the git + gh commands.
       # GEMINI_CLI_TRUST_WORKSPACE is required: a CI checkout is never a
@@ -161,7 +168,7 @@ jobs:
               change fixes it, open the PR as a DRAFT and explain what a human should check.
           settings: |
             {
-              "model": { "maxSessionTurns": ${{ vars.HOTFIX_MAX_TURNS || '40' }} },
+              "model": { "maxSessionTurns": ${{ vars.HOTFIX_GEMINI_MAX_TURNS || vars.HOTFIX_MAX_TURNS || '40' }} },
               "tools": {
                 "core": [
                   "read_file", "read_many_files", "write_file", "replace",
