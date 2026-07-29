@@ -265,7 +265,9 @@ locations.
 
 Backend (backend repo / Firebase):
 - [ ] Firebase project on **Blaze**, Crashlytics enabled and reporting
-- [ ] `firebase-tools` installed, `firebase login`, `firebase use <project>`
+- [ ] `firebase-tools` installed, `firebase login`, `firebase use <project>` —
+      must match `project_id` in the app's `google-services.json`, or alerts
+      never arrive (pinned in `.firebaserc`)
 - [ ] `npm install` in `backend/`
 - [ ] `src/hotfix.config.ts` filled in (packages, repo, project, region, branch, mentions, dispatchMode)
 - [ ] `rm -rf lib/ && npm run build` → no errors → `grep -c parseAlertTitle lib/index.js` = 2
@@ -360,7 +362,11 @@ HotFixAgent - Setup
                          └─→ GitHub secret  CALLBACK_TOKEN  (paste SAME)
 
 1. In Backend terminal 
-2. firebase use api-project-147253807975
+2. firebase use hotfixagent
+   ⚠ This MUST be the project the Android app reports to — the `project_id` in
+   `app/google-services.json` (here: `hotfixagent`). Deploying to any other
+   project silently does nothing: the functions come up fine but no Crashlytics
+   alert ever reaches them. `.firebaserc` now pins this.
 3. npm install rm -rf lib/ npm run build
 4. Enable Service Usage API
 5. firebase functions:secrets:set GITHUB_TOKEN
