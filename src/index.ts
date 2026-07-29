@@ -343,8 +343,25 @@ async function triggerGitHubWorkflow(
 
 function buildTraceFromAlert(title: string, subtitle: string): string {
   const type = extractType(subtitle);
+  const message = extractMessage(subtitle, type);
   const { symbol, file } = parseAlertTitle(title);
-  return `${type}\n\tat ${symbol}(${file})`;
+  // Emit the standard Java header "Type: message" — the parser only captures a
+  // message when the colon is present, and the message ("length=3; index=8")
+  // is often the strongest hint the agent gets.
+  const header = message ? `${type}: ${message}` : type;
+  return `${header}\n\tat ${symbol}(${file})`;
+}
+
+/**
+ * Crashlytics subtitles read "<type> - <message>", e.g.
+ *   "java.lang.ArrayIndexOutOfBoundsException - length=3; index=8"
+ * Return just the message half, without the separator.
+ */
+function extractMessage(subtitle: string, type: string): string {
+  const s = subtitle ?? "";
+  const i = s.indexOf(type);
+  const rest = i >= 0 ? s.slice(i + type.length) : s;
+  return rest.replace(/^\s*[-:–—]\s*/, "").replace(/\s+/g, " ").trim();
 }
 
 /**
