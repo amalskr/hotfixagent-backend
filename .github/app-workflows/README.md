@@ -25,8 +25,12 @@ API is over quota. Each run:
 
 1. pre-checks the Anthropic API with a 1-token request;
 2. `429` / `529` / `credit balance too low` / rejected key → runs on Gemini;
-3. otherwise runs on Claude, and if Claude *fails without opening a PR*, retries
-   the same crash once on Gemini.
+3. otherwise runs on Claude.
+
+If the chosen provider fails *without opening a PR or pushing the branch*, the
+crash is retried once on the other provider (Gemini → Claude only when a fresh
+pre-check returns `200`). A run bounces at most once, and a final guard fails the
+run when no PR exists at the end — so "all providers failed" never shows green.
 
 Required app-repo secrets: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (either one may
 be omitted — with only one key set, that provider is always used).
@@ -39,5 +43,7 @@ Forcing a provider:
 | One manual run | Actions → HotFix Agent → Run workflow → **LLM provider** = `gemini` |
 | One PR revision | include `llm=gemini` in the `@claude` comment |
 
-Optional variable `HOTFIX_GEMINI_MODEL` pins the Gemini model (default: the
-Gemini CLI's own default), e.g. `gemini-3-pro-preview`.
+`HOTFIX_GEMINI_MODEL` pins the Gemini model. Worth setting explicitly — left
+unset, the fallback follows whatever the Gemini CLI currently defaults to, and
+free-tier daily quotas are per-model, so the default can be exhausted while
+another model still has budget.

@@ -179,6 +179,10 @@ jobs:
           git reset --hard
           git clean -fd -e .gemini
           gh pr checkout "$PR_NUMBER"
+          # Recorded so a later Claude retry can tell whether Gemini pushed
+          # anything before it failed.
+          echo "PR_BRANCH=$(git rev-parse --abbrev-ref HEAD)" >> "$GITHUB_ENV"
+          echo "PR_SHA_BEFORE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Compose Gemini prompt
         if: steps.pick.outputs.provider == 'gemini' || steps.fallback.outputs.run == 'true'
@@ -222,6 +226,7 @@ jobs:
       - name: Gemini revises the PR
         id: gemini
         if: steps.pick.outputs.provider == 'gemini' || steps.fallback.outputs.run == 'true'
+        continue-on-error: true
         uses: google-github-actions/run-gemini-cli@v0
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
@@ -237,3 +242,55 @@ jobs:
                 ]
               }
             }
+
+      # Gemini ran and failed (e.g. its own daily quota). Retry on Claude, but
+      # only if Gemini pushed nothing and Claude is healthy right now.
+      - name: Decide Claude fallback
+        id: rfallback
+        if: steps.gemini.outcome == 'failure' && steps.pick.outputs.have_claude == 'true' && steps.fallback.outputs.run != 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PROBE_MODEL: ${{ vars.HOTFIX_PROBE_MODEL || 'claude-haiku-4-5-20251001' }}
+        run: |
+          set -uo pipefail
+          git fetch -q origin "$PR_BRANCH" 2>/dev/null || true
+          REMOTE_SHA=$(git rev-parse "origin/$PR_BRANCH" 2>/dev/null || echo "")
+          if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" != "${PR_SHA_BEFORE:-}" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Gemini failed after pushing to $PR_BRANCH — not re-running on Claude."
+            exit 0
+          fi
+          code=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' \
+            https://api.anthropic.com/v1/messages \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "{\"model\":\"${PROBE_MODEL}\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
+            2>/dev/null) || code=000
+          if [ "$code" = "200" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Gemini revision failed with nothing pushed — retrying on Claude."
+            echo "**Fallback:** Gemini failed, retrying on Claude." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Gemini failed and the Anthropic pre-check returned HTTP $code — no provider left to try."
+          fi
+
+      - name: Reset workspace before Claude retry
+        if: steps.rfallback.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          git reset --hard
+          git clean -fd -e .gemini
+
+      - name: Claude revises the PR (retry)
+        id: claude_retry
+        if: steps.rfallback.outputs.run == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          trigger_phrase: ${{ vars.HOTFIX_TRIGGER_PHRASE || '@claude' }}
+          claude_args: |
+            --max-turns ${{ vars.HOTFIX_MAX_TURNS || '40' }}
+            --allowedTools "Read,Edit,Write,Grep,Glob,Bash(./gradlew:*),Bash(git:*),Bash(gh:*)"
+            --append-system-prompt "You are revising an existing hotfix PR based on reviewer feedback. Address the request precisely. Never silence a crash with an empty or swallowing try/catch — fix the root cause (validate input, null-safety, correct logic). Keep the change minimal. Build and run the unit tests before pushing. Push to the same PR branch; do not open a new PR."

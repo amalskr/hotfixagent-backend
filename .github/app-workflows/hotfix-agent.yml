@@ -297,6 +297,7 @@ jobs:
       - name: Run HotFix agent (Gemini)
         id: gemini
         if: steps.pick.outputs.provider == 'gemini' || steps.fallback.outputs.run == 'true'
+        continue-on-error: true
         uses: google-github-actions/run-gemini-cli@v0
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
@@ -313,12 +314,67 @@ jobs:
               }
             }
 
+      # Gemini ran and failed (e.g. its own daily quota). Retry on Claude, but
+      # only if nothing was pushed and Claude is actually healthy right now — in
+      # auto mode Gemini was picked *because* Claude was exhausted, so a blind
+      # retry would just burn another run.
+      - name: Decide Claude fallback
+        id: rfallback
+        if: steps.gemini.outcome == 'failure' && steps.pick.outputs.have_claude == 'true' && steps.fallback.outputs.run != 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PROBE_MODEL: ${{ vars.HOTFIX_PROBE_MODEL || 'claude-haiku-4-5-20251001' }}
+        run: |
+          set -uo pipefail
+          PR_URL=$(gh pr list --head "$BRANCH_NAME" --state all --json url --limit 1 \
+                     --jq '.[0].url // empty' 2>/dev/null || true)
+          if [ -n "$PR_URL" ] || git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Gemini failed after pushing work for $BRANCH_NAME — not re-running on Claude."
+            exit 0
+          fi
+          code=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' \
+            https://api.anthropic.com/v1/messages \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "{\"model\":\"${PROBE_MODEL}\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
+            2>/dev/null) || code=000
+          if [ "$code" = "200" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Gemini run failed with no PR — retrying this crash on Claude."
+            echo "**Fallback:** Gemini failed, retrying on Claude." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Gemini failed and the Anthropic pre-check returned HTTP $code — no provider left to try."
+          fi
+
+      - name: Reset workspace before Claude retry
+        if: steps.rfallback.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          git reset --hard
+          git clean -fd -e .gemini
+          git checkout "$SRC_BRANCH"
+
+      - name: Run HotFix agent (Claude retry)
+        id: claude_retry
+        if: steps.rfallback.outputs.run == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: ${{ env.HOTFIX_PROMPT }}
+          claude_args: |
+            --max-turns ${{ vars.HOTFIX_MAX_TURNS || '40' }}
+            --allowedTools "Read,Edit,Write,Grep,Glob,Bash(./gradlew:*),Bash(git:*),Bash(gh:*)"
+
       - name: Report status to Slack
         if: always()
         env:
           CALLBACK_URL:   ${{ secrets.HOTFIX_CALLBACK_URL }}
           CALLBACK_TOKEN: ${{ secrets.CALLBACK_TOKEN }}
-          PROVIDER: ${{ steps.fallback.outputs.run == 'true' && 'gemini (Claude fallback)' || steps.pick.outputs.provider }}
+          PROVIDER: ${{ steps.rfallback.outputs.run == 'true' && 'claude (Gemini fallback)' || (steps.fallback.outputs.run == 'true' && 'gemini (Claude fallback)' || steps.pick.outputs.provider) }}
           PICK_REASON: ${{ steps.pick.outputs.reason }}
         run: |
           set -e
@@ -340,3 +396,18 @@ jobs:
             -d "$(jq -n --arg id "$ISSUE_ID" --arg s "$STATUS" --arg u "$PR_URL" \
                   --arg e "$EXC" --arg c "$CLS" --arg m "$MTH" --arg sum "$SUMMARY" \
                   '{issueId:$id, status:$s, prUrl:$u, exceptionType:$e, targetClass:$c, targetMethod:$m, summary:$sum}')"
+
+      # The agent steps are continue-on-error so the fallback chain and the Slack
+      # callback always get their turn — without this guard a run where every
+      # provider failed would finish GREEN with no fix to show for it.
+      - name: Fail the run if no fix was produced
+        if: always()
+        run: |
+          set -uo pipefail
+          PR_URL=$(gh pr list --head "$BRANCH_NAME" --state all --json url --limit 1 \
+                     --jq '.[0].url // empty' 2>/dev/null || true)
+          if [ -z "$PR_URL" ]; then
+            echo "::error::No pull request was produced for $BRANCH_NAME — every available provider failed or declined."
+            exit 1
+          fi
+          echo "Fix PR: $PR_URL"

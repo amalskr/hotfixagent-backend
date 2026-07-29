@@ -444,10 +444,18 @@ Every run decides the provider before starting:
    blip, unexpected status) keeps Claude, so a flaky probe can't misroute a run.
 2. **Run** — Claude via `anthropics/claude-code-action@v1`, or Gemini via
    `google-github-actions/run-gemini-cli@v0`.
-3. **Mid-run fallback** — if Claude starts and then fails *without* opening a PR
-   or pushing the branch, the same crash is retried once on Gemini. If Claude
-   already pushed, no retry happens (a second agent must not build on a
-   half-finished fix).
+3. **Mid-run fallback, both directions** — if the chosen provider fails *without*
+   opening a PR or pushing the branch, the crash is retried once on the other
+   one. Claude → Gemini needs no extra check. Gemini → Claude re-runs the
+   pre-check first and only proceeds on a healthy `200`, because in auto mode
+   Gemini was picked precisely *because* Claude was exhausted — a blind retry
+   would just burn a second run. Either way, if the first agent already pushed,
+   no retry happens: a second agent must not build on a half-finished fix. A run
+   never bounces more than once.
+4. **No silent green** — the agent steps are `continue-on-error` so the fallback
+   chain and the Slack callback always get their turn. A final guard fails the
+   run if no PR exists at the end, so "every provider failed" can't read as
+   success in the Actions list.
 
 Both providers get the **same prompt**, composed once per run into
 `$GITHUB_ENV`, so they cannot drift apart. Gemini gets extra `git` + `gh`
@@ -466,6 +474,14 @@ file/search/shell tools. The Slack outcome message names the provider that ran.
 With only one key configured, that provider is always used — omit
 `ANTHROPIC_API_KEY` to run Gemini-only, or `GEMINI_API_KEY` for the old
 Claude-only behaviour. Neither key set fails the run with a clear error.
+
+> **A free-tier Gemini key is a weak fallback.** Google AI Studio's free tier caps
+> requests *per model per day*, and that budget is shared with anything else using
+> the key (e.g. the app repo's `agentTest` plugin). A fallback that can be
+> exhausted at the same moment as Claude isn't really a fallback — enable billing
+> on the key's project for production use. Pin `HOTFIX_GEMINI_MODEL` too: left
+> unset, the fallback silently follows whatever the Gemini CLI currently defaults
+> to, and per-model daily quotas are independent of each other.
 
 ## 8. Safety & cost notes
 
