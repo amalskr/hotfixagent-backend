@@ -40,8 +40,9 @@ Key design choices:
 | `backend/src/index.ts` | Firebase Cloud Functions | 3 functions: `hotfixOnFatalCrash`, `hotfixOnRegression`, `hotfixStatusCallback` |
 | `backend/src/stackTraceParser.ts` | (pure logic) | parse trace → culprit frame + confidence label |
 | `backend/src/hotfix.config.ts` | **single source of truth** | all app-specific backend settings |
-| `.github/workflows/hotfix-agent.yml` | target app repo | runs the LLM agent, opens PR, calls status callback |
+| `.github/workflows/hotfix-agent.yml` | target app repo | runs the LLM agent (Claude, Gemini fallback), opens PR, calls status callback |
 | `.github/workflows/hotfix-revise.yml` | target app repo | reviewer-driven revision via PR mention |
+| `.github/app-workflows/` | **this** repo | template copies of the two workflows above — edit here, copy to the app repo |
 
 ## 2b. Two repositories — what goes where
 
@@ -79,7 +80,7 @@ repo** (`owner/app-repo`), never the backend repo.
 | Firebase secrets: `GITHUB_TOKEN`, `SLACK_WEBHOOK_URL`, `CALLBACK_TOKEN` | Firebase (set via CLI) |
 | `.github/workflows/hotfix-agent.yml` | **Mobile app** repo |
 | `.github/workflows/hotfix-revise.yml` | **Mobile app** repo |
-| GitHub secrets: `ANTHROPIC_API_KEY`, `HOTFIX_CALLBACK_URL`, `CALLBACK_TOKEN` | **Mobile app** repo |
+| GitHub secrets: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `HOTFIX_CALLBACK_URL`, `CALLBACK_TOKEN` | **Mobile app** repo |
 | GitHub variables: `HOTFIX_BRANCH`, `HOTFIX_PR_BASE`, `HOTFIX_TRIGGER_PHRASE` … | **Mobile app** repo |
 
 > The `GITHUB_TOKEN` Firebase secret must reach the **app** repo and have:
@@ -97,8 +98,10 @@ repo** (`owner/app-repo`), never the backend repo.
 
 - An Android app using **Firebase Crashlytics** (Blaze plan — Crashlytics alert
   triggers need it), with the app source in a **GitHub** repo.
-- **Anthropic API key**, a **GitHub token** (repo + workflow scope), and a
-  **Slack incoming webhook** (optional but recommended).
+- **Anthropic API key** and/or a **Gemini API key** (Claude runs the agent;
+  Gemini takes over when the Anthropic API is over quota — see §7c), a **GitHub
+  token** (repo + workflow scope), and a **Slack incoming webhook** (optional but
+  recommended).
 - `firebase-tools` and Node 22 locally.
 - **Release-build note:** enable R8/ProGuard **mapping file upload** and retain
   source/line attributes, or release crashes arrive obfuscated and the agent
@@ -120,6 +123,7 @@ then the **mobile app repo**. A copy-paste checklist is at the end (§4h).
 | Value | Where to get it |
 |---|---|
 | `ANTHROPIC_API_KEY` | console.anthropic.com → API keys |
+| `GEMINI_API_KEY` | aistudio.google.com → Get API key (fallback LLM; optional but recommended) |
 | `GITHUB_TOKEN` | GitHub token with repo access — see **Appendix A** (needs Pull requests: R/W) |
 | `SLACK_WEBHOOK_URL` | Slack → see step 4f below |
 | `CALLBACK_TOKEN` | generate yourself: `openssl rand -hex 32` |
@@ -222,12 +226,14 @@ npm run deploy
 1. Copy `.github/workflows/hotfix-agent.yml` and `hotfix-revise.yml` into the
    **app repo**, commit, and push.
 2. Repo → **Settings → Secrets and variables → Actions → Secrets** → add:
-    - `ANTHROPIC_API_KEY`
+    - `ANTHROPIC_API_KEY` (primary LLM)
+    - `GEMINI_API_KEY` (fallback LLM, used when Claude is over quota — see §7c)
     - `HOTFIX_CALLBACK_URL` = the URL from step 4g
     - `CALLBACK_TOKEN` = the **same** value you set in Firebase (step 4e)
 3. (Optional) **Variables** tab — override CI defaults:
    `HOTFIX_BRANCH`, `HOTFIX_PR_BASE`, `HOTFIX_BUILD_CMD`, `HOTFIX_TEST_CMD`,
-   `HOTFIX_JAVA_VERSION`, `HOTFIX_MAX_TURNS`, `HOTFIX_TRIGGER_PHRASE`.
+   `HOTFIX_JAVA_VERSION`, `HOTFIX_MAX_TURNS`, `HOTFIX_TRIGGER_PHRASE`,
+   `HOTFIX_GEMINI_MODEL`.
 4. **Settings → Actions → General → Workflow permissions** → enable
    **Read and write** + **Allow GitHub Actions to create and approve pull requests**.
 5. (Recommended) Add **branch protection** on `main` so nothing auto-merges.
@@ -271,6 +277,7 @@ Backend (backend repo / Firebase):
 Mobile app repo (GitHub):
 - [ ] `hotfix-agent.yml` + `hotfix-revise.yml` in `.github/workflows/`
 - [ ] Secret `ANTHROPIC_API_KEY`
+- [ ] Secret `GEMINI_API_KEY` (fallback when Claude is over quota)
 - [ ] Secret `HOTFIX_CALLBACK_URL` (from deploy output)
 - [ ] Secret `CALLBACK_TOKEN` (**same** as Firebase)
 - [ ] (optional) Variables: `HOTFIX_BRANCH`, `HOTFIX_PR_BASE`, …
@@ -309,12 +316,14 @@ Settings → Secrets and variables → Actions → **Variables**:
 | `HOTFIX_BUILD_CMD` | `./gradlew assembleDebug` | build command |
 | `HOTFIX_TEST_CMD` | `./gradlew testDebugUnitTest` | test command |
 | `HOTFIX_JAVA_VERSION` | `17` | JDK version |
-| `HOTFIX_MAX_TURNS` | `40` | agent iteration budget (cost control) |
+| `HOTFIX_MAX_TURNS` | `40` | agent iteration budget (cost control; both LLMs) |
 | `HOTFIX_TRIGGER_PHRASE` | `@claude` | mention that triggers a PR revision |
+| `HOTFIX_GEMINI_MODEL` | Gemini CLI default | pin the fallback model, e.g. `gemini-3-pro-preview` |
+| `HOTFIX_PROBE_MODEL` | `claude-haiku-4-5-20251001` | cheap model for the Anthropic quota pre-check |
 
-Plus the new repo's **Secrets**: `ANTHROPIC_API_KEY`, `HOTFIX_CALLBACK_URL`,
-`CALLBACK_TOKEN`. That's it — no source edits in `index.ts`, the parser, or the
-workflows.
+Plus the new repo's **Secrets**: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+`HOTFIX_CALLBACK_URL`, `CALLBACK_TOKEN`. That's it — no source edits in
+`index.ts`, the parser, or the workflows.
 
 > Because confidence labelling depends on `appPackages` (app-owned vs framework),
 > setting the right package prefix is the most important change for a new app.
@@ -325,7 +334,7 @@ workflows.
 
 **Backend (`hotfix.config.ts`)** — `appPackages`, `githubRepo`, `firebaseProjectId`,
 `crashlyticsAppId`, `region`, `targetBranch`, `dispatchEventType`, `functionMemory`,
-`autoFixableTypes`, `notAutoFixableTypes`.
+`llmProvider`, `autoFixableTypes`, `notAutoFixableTypes`.
 
 **CI (repo Variables)** — see the table in §5B.
 
@@ -385,8 +394,9 @@ firebase deploy --only functions --force
    — so the type alone never decides it.
 3. It posts a Slack "attempting" message and fires a `repository_dispatch` to the
    app repo with the crash details + confidence.
-4. `hotfix-agent.yml` checks out the target branch and runs the Claude Code agent
-   (read/search/edit/build/test, bounded turns, single attempt). The agent finds
+4. `hotfix-agent.yml` checks out the target branch, picks the LLM provider
+   (Claude, or Gemini when the Anthropic API is over quota — §7c), and runs the
+   agent (read/search/edit/build/test, bounded turns, single attempt). The agent finds
    the fault, applies a minimal root-cause fix on a new branch
    `agent/<exception>-<method>-<issueId>` (it never edits the main branch), builds,
    tests, and opens a PR (draft if it isn't confident) with base `HOTFIX_PR_BASE`.
@@ -421,6 +431,42 @@ avoids re-running (and re-paying for) the agent on an issue already in flight.
 > configure. The Cloud Function makes no LLM calls, so it has no token cost. The
 > loop guard above is the real saving.
 
+## 7c. LLM providers — Claude primary, Gemini fallback
+
+An over-quota Anthropic API used to mean a dead workflow run and a
+"could-not-fix" Slack message. Both workflows now switch to **Gemini** instead.
+
+Every run decides the provider before starting:
+
+1. **Pre-check** — a 1-token request to the Anthropic Messages API.
+   `429` (rate limited), `529` (overloaded), a `credit balance too low` error, or
+   `401`/`403` (key rejected) → **run on Gemini**. Anything inconclusive (network
+   blip, unexpected status) keeps Claude, so a flaky probe can't misroute a run.
+2. **Run** — Claude via `anthropics/claude-code-action@v1`, or Gemini via
+   `google-github-actions/run-gemini-cli@v0`.
+3. **Mid-run fallback** — if Claude starts and then fails *without* opening a PR
+   or pushing the branch, the same crash is retried once on Gemini. If Claude
+   already pushed, no retry happens (a second agent must not build on a
+   half-finished fix).
+
+Both providers get the **same prompt**, composed once per run into
+`$GITHUB_ENV`, so they cannot drift apart. Gemini gets extra `git` + `gh`
+instructions because the Gemini CLI has no built-in PR plumbing. Its turn budget
+is the same `HOTFIX_MAX_TURNS`, and its tool access is restricted to
+file/search/shell tools. The Slack outcome message names the provider that ran.
+
+**Forcing a provider:**
+
+| Scope | How |
+|---|---|
+| All crashes | `llmProvider: "gemini"` (or `"claude"` / `"auto"`) in `src/hotfix.config.ts`, then redeploy |
+| One manual run | Actions → HotFix Agent → *Run workflow* → **LLM provider** |
+| One PR revision | add `llm=gemini` to the `@claude` comment |
+
+With only one key configured, that provider is always used — omit
+`ANTHROPIC_API_KEY` to run Gemini-only, or `GEMINI_API_KEY` for the old
+Claude-only behaviour. Neither key set fails the run with a clear error.
+
 ## 8. Safety & cost notes
 
 - The agent has **no merge rights**; PRs are human-reviewed.
@@ -428,7 +474,11 @@ avoids re-running (and re-paying for) the agent on an issue already in flight.
 - **Cost:** every crash runs the agent. To control spend, tune `HOTFIX_MAX_TURNS`,
   consider skipping the agent for `needs_human` types, and de-duplicate recurring
   crashes (a persistent attempt counter is a known extension).
-- **Secrets** live only in Firebase/GitHub secret stores — never in `hotfix.config.ts`.
+- **Fallback cost:** a Claude failure that produced no PR is retried on Gemini, so
+  a failed crash can cost two agent runs. The `HOTFIX_MAX_TURNS` budget applies to
+  each. Set `llmProvider` to pin one provider if you'd rather never double-run.
+- **Secrets** live only in Firebase/GitHub secret stores — never in
+  `hotfix.config.ts` and never in the workflow YAML.
 
 ## 9. File layout (per repo)
 
@@ -439,6 +489,7 @@ src/
   index.ts              ← Cloud Functions (no app-specifics)
   githubGuard.ts        ← GitHub-native loop guard (no DB)
   stackTraceParser.ts   ← pure parser (no app-specifics)
+.github/app-workflows/  ← template copies of the app-repo workflows (not run here)
 package.json            ← deps: firebase-functions  (no firebase-admin needed)
 tsconfig.json, …        ← your existing build config
 ```

@@ -1,0 +1,342 @@
+name: HotFix Agent
+
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('HotFix: {0} in {1}', github.event.inputs.exceptionType, github.event.inputs.targetClass)
+      || format('HotFix: {0} in {1}', github.event.client_payload.exceptionType, github.event.client_payload.targetClass) }}
+
+# Triggered by the Cloud Function via repository_dispatch (type must match
+# config.dispatchEventType in hotfix.config.ts). workflow_dispatch = manual test.
+#
+# LLM PROVIDERS (Claude primary, Gemini fallback)
+#   The agent runs on Claude by default. If the Anthropic API is out of quota
+#   (429 / 529 / "credit balance too low") or the key is rejected, the run
+#   switches to Gemini instead of dying. If Claude starts and then fails without
+#   producing a PR, Gemini retries the same crash once.
+#   Force one provider with the `llm` input (auto | claude | gemini), or by
+#   sending `llm` in the repository_dispatch client_payload.
+#
+# SECRETS
+#   ANTHROPIC_API_KEY     Claude (primary). Omit to run Gemini-only.
+#   GEMINI_API_KEY        Google AI Studio key (fallback). Omit to run Claude-only.
+#   HOTFIX_CALLBACK_URL   hotfixStatusCallback URL
+#   CALLBACK_TOKEN        shared token, same value as the Firebase secret
+#
+# CI-side app settings come from repo VARIABLES (Settings → Secrets and
+# variables → Actions → Variables), with safe defaults:
+#   HOTFIX_BRANCH        (default: main)        branch to fork the fix from
+#   HOTFIX_PR_BASE       (default: main)        PR base (human can re-target to e.g. development)
+#   HOTFIX_BUILD_CMD     (default: ./gradlew assembleDebug)
+#   HOTFIX_TEST_CMD      (default: ./gradlew testDebugUnitTest)
+#   HOTFIX_JAVA_VERSION  (default: 17)
+#   HOTFIX_MAX_TURNS     (default: 40)          agent iteration budget (both providers)
+#   HOTFIX_GEMINI_MODEL  (default: CLI default) e.g. gemini-3-pro-preview
+#   HOTFIX_PROBE_MODEL   (default: claude-haiku-4-5-20251001) cheap model for the quota pre-check
+on:
+  repository_dispatch:
+    types: [hotfix-crash]
+  workflow_dispatch:
+    inputs:
+      exceptionType:   { description: "Exception type", required: true, default: "java.lang.ArithmeticException" }
+      targetClass:     { description: "Blamed class",   required: true, default: "com.example.app.MainActivityKt" }
+      targetMethod:    { description: "Blamed method",  required: true, default: "onCreate" }
+      message:         { description: "Crash message",  required: false, default: "divide by zero" }
+      issueId:         { description: "Crashlytics issue id", required: false, default: "manual-test" }
+      llm:
+        description: "LLM provider"
+        required: false
+        default: auto
+        type: choice
+        options: [auto, claude, gemini]
+
+# Atomic per-issue guard: only one run per crash issue at a time (a second
+# event for the same issue while one is running will not start a parallel run).
+concurrency:
+  group: hotfix-${{ github.event.client_payload.issueId || github.event.inputs.issueId }}
+  cancel-in-progress: false
+
+jobs:
+  hotfix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+
+    # Crash details are exposed as env vars (never interpolated into shell
+    # scripts) so a crafted crash message cannot inject commands.
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Gemini CLI refuses to run tools in an "untrusted" folder — it silently
+      # downgrades --yolo to approval mode and then exits 1. A CI checkout is
+      # never trusted, so this is required for the Gemini path to work at all.
+      GEMINI_CLI_TRUST_WORKSPACE: "true"
+      EXC:         ${{ github.event.client_payload.exceptionType || github.event.inputs.exceptionType }}
+      MSG:         ${{ github.event.client_payload.message || github.event.inputs.message }}
+      CLS:         ${{ github.event.client_payload.targetClass || github.event.inputs.targetClass }}
+      MTH:         ${{ github.event.client_payload.targetMethod || github.event.inputs.targetMethod }}
+      ISSUE_ID:    ${{ github.event.client_payload.issueId || github.event.inputs.issueId }}
+      CONFIDENCE:  ${{ github.event.client_payload.confidence || 'auto' }}
+      BRANCH_NAME: ${{ github.event.client_payload.branchName || format('agent/manual-{0}', github.event.inputs.issueId) }}
+      SRC_BRANCH:  ${{ vars.HOTFIX_BRANCH || 'main' }}
+      PR_BASE:     ${{ vars.HOTFIX_PR_BASE || 'main' }}
+      BUILD_CMD:   ${{ vars.HOTFIX_BUILD_CMD || './gradlew assembleDebug' }}
+      TEST_CMD:    ${{ vars.HOTFIX_TEST_CMD || './gradlew testDebugUnitTest' }}
+      MAX_TURNS:   ${{ vars.HOTFIX_MAX_TURNS || '40' }}
+
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ vars.HOTFIX_BRANCH || 'main' }}
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ vars.HOTFIX_JAVA_VERSION || '17' }}
+
+      - name: Prepare workspace for the agent
+        run: |
+          set -euo pipefail
+          git config user.name  "hotfix-agent[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The Gemini action writes .gemini/settings.json into the checkout;
+          # keep it out of the agent's commit.
+          echo '.gemini/' >> .git/info/exclude
+
+      # One prompt, both providers. Written to $GITHUB_ENV so the Claude and
+      # Gemini steps cannot drift apart. Values are expanded from env vars, and
+      # shell expansion is not recursive, so payload text stays inert.
+      - name: Compose agent prompt
+        run: |
+          set -euo pipefail
+          {
+            echo "HOTFIX_PROMPT<<__HOTFIX_EOF__"
+            cat <<EOF
+          A production crash was reported by Firebase Crashlytics in this Android app.
+          The live app is published from the '$SRC_BRANCH' branch, so this is a hotfix.
+
+          Exception type : $EXC
+          Message        : $MSG
+          Blamed class   : $CLS
+          Blamed method  : $MTH
+          Crashlytics id : $ISSUE_ID
+          Confidence     : $CONFIDENCE
+
+          Do the following, carefully:
+          1. Find the Kotlin/Java file containing that class and method. The method
+             may be a synthesized lambda name (e.g. "foo\\\$lambda\\\$3") — in that case
+             look at the base function. If the blamed class is "unknown" or lives
+             only in the SDK/framework (e.g. com.google.*, android.*), search the
+             app source for the nearest related call site instead.
+          2. Diagnose the ROOT CAUSE and apply a MINIMAL, safe fix that addresses
+             WHY the exception is thrown — validate input, add a null/bounds/state
+             guard, or correct the logic. Do NOT refactor unrelated code.
+          3. Build with '$BUILD_CMD' and run '$TEST_CMD'. If they fail, read the
+             errors and iterate until both pass.
+          4. Do NOT edit '$SRC_BRANCH' directly. Create a new branch named exactly
+             '$BRANCH_NAME' off '$SRC_BRANCH', commit the fix there, and open a Pull
+             Request with base branch '$PR_BASE'. In the PR body explain the crash,
+             root cause, fix, and Crashlytics issue id. DO NOT merge — a human
+             decides whether to merge into '$PR_BASE' or re-target it.
+
+          IMPORTANT quality rules:
+          - NEVER silence a crash with an empty or swallowing try/catch.
+          - NEVER catch kotlinx.coroutines CancellationException / JobCancellationException.
+          - This may be an environmental crash (network, DNS, SSL, out-of-memory, IPC).
+            If there is no genuine app-code root cause, or you are not confident the
+            change fixes it, open the PR as a DRAFT and explain what a human should check.
+          EOF
+            echo "__HOTFIX_EOF__"
+          } >> "$GITHUB_ENV"
+
+      # Gemini CLI has no built-in git/PR plumbing (claude-code-action does), so
+      # it gets the same prompt plus explicit git + gh instructions.
+      - name: Compose Gemini prompt
+        run: |
+          set -euo pipefail
+          {
+            echo "HOTFIX_GEMINI_PROMPT<<__HOTFIX_EOF__"
+            printf '%s\n' "$HOTFIX_PROMPT"
+            cat <<EOF
+
+          Mechanics for step 4 (you have shell access; git and gh are authenticated):
+          - git checkout -b '$BRANCH_NAME'
+          - stage only the files you changed, then commit with a descriptive message
+          - git push -u origin '$BRANCH_NAME'
+          - open the PR with:
+              gh pr create --base '$PR_BASE' --head '$BRANCH_NAME' --title <title> --body <body>
+            add --draft when you are not confident in the fix
+          - do not commit .gemini/, build outputs, or unrelated files
+          - never run 'gh pr merge'
+          EOF
+            echo "__HOTFIX_EOF__"
+          } >> "$GITHUB_ENV"
+
+      # Decide which provider runs. In auto mode this pings the Anthropic API
+      # with a 1-token request; over-quota / rejected key routes to Gemini.
+      - name: Choose LLM provider
+        id: pick
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          REQUESTED: ${{ github.event.client_payload.llm || github.event.inputs.llm || 'auto' }}
+          PROBE_MODEL: ${{ vars.HOTFIX_PROBE_MODEL || 'claude-haiku-4-5-20251001' }}
+        run: |
+          set -uo pipefail
+
+          have_claude=false; have_gemini=false
+          if [ -n "${ANTHROPIC_API_KEY:-}" ]; then have_claude=true; fi
+          if [ -n "${GEMINI_API_KEY:-}" ];    then have_gemini=true; fi
+          echo "have_claude=$have_claude" >> "$GITHUB_OUTPUT"
+          echo "have_gemini=$have_gemini" >> "$GITHUB_OUTPUT"
+
+          # Anthropic quota pre-check. Anything inconclusive => keep Claude and
+          # let the real run decide, so a flaky probe never misroutes.
+          probe() {
+            local code body
+            code=$(curl -sS -m 30 -o /tmp/anthropic-probe.json -w '%{http_code}' \
+              https://api.anthropic.com/v1/messages \
+              -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              -d "{\"model\":\"${PROBE_MODEL}\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
+              2>/dev/null) || code=000
+            body=$(cat /tmp/anthropic-probe.json 2>/dev/null || true)
+            echo "Anthropic pre-check: HTTP $code" >&2
+            case "$code" in
+              200)     echo ok ;;
+              429|529) echo quota ;;
+              401|403) echo rejected ;;
+              400)
+                if printf '%s' "$body" | grep -qiE 'credit balance|quota|rate.?limit'; then
+                  echo quota
+                else
+                  echo ok
+                fi ;;
+              *) echo unknown ;;
+            esac
+          }
+
+          provider=""; reason=""
+          case "$REQUESTED" in
+            claude)
+              if [ "$have_claude" = true ]; then provider=claude; reason="forced by llm=claude"
+              else provider=gemini; reason="llm=claude requested but ANTHROPIC_API_KEY is not set"; fi ;;
+            gemini)
+              if [ "$have_gemini" = true ]; then provider=gemini; reason="forced by llm=gemini"
+              else provider=claude; reason="llm=gemini requested but GEMINI_API_KEY is not set"; fi ;;
+            *)
+              if   [ "$have_claude" = false ] && [ "$have_gemini" = true ]; then
+                provider=gemini; reason="no ANTHROPIC_API_KEY"
+              elif [ "$have_claude" = true ] && [ "$have_gemini" = false ]; then
+                provider=claude; reason="no GEMINI_API_KEY (no fallback available)"
+              elif [ "$have_claude" = true ] && [ "$have_gemini" = true ]; then
+                case "$(probe)" in
+                  quota)    provider=gemini; reason="Anthropic API over quota / rate limited" ;;
+                  rejected) provider=gemini; reason="Anthropic API key rejected" ;;
+                  ok)       provider=claude; reason="Anthropic API healthy" ;;
+                  *)        provider=claude; reason="Anthropic pre-check inconclusive; trying Claude first" ;;
+                esac
+              else
+                echo "::error::Neither ANTHROPIC_API_KEY nor GEMINI_API_KEY is set."
+                exit 1
+              fi ;;
+          esac
+
+          echo "provider=$provider" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason"     >> "$GITHUB_OUTPUT"
+          echo "::notice::HotFix agent provider: $provider ($reason)"
+          echo "**LLM provider:** \`$provider\` — $reason" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run HotFix agent (Claude)
+        id: claude
+        if: steps.pick.outputs.provider == 'claude'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: ${{ env.HOTFIX_PROMPT }}
+          claude_args: |
+            --max-turns ${{ vars.HOTFIX_MAX_TURNS || '40' }}
+            --allowedTools "Read,Edit,Write,Grep,Glob,Bash(./gradlew:*),Bash(git:*),Bash(gh:*)"
+
+      # Claude ran and failed. Retry on Gemini, but only if nothing was pushed —
+      # otherwise a second agent would work on top of a half-finished fix.
+      - name: Decide Gemini fallback
+        id: fallback
+        if: steps.claude.outcome == 'failure' && steps.pick.outputs.have_gemini == 'true'
+        run: |
+          set -uo pipefail
+          PR_URL=$(gh pr list --head "$BRANCH_NAME" --state all --json url --limit 1 \
+                     --jq '.[0].url // empty' 2>/dev/null || true)
+          if [ -n "$PR_URL" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Claude failed but already opened $PR_URL — not re-running on Gemini."
+            exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Claude failed after pushing $BRANCH_NAME — not re-running on Gemini."
+            exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "::warning::Claude run failed with no PR — retrying this crash on Gemini."
+          echo "**Fallback:** Claude failed, retrying on Gemini." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Reset workspace before Gemini retry
+        if: steps.fallback.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          git reset --hard
+          git clean -fd -e .gemini
+          git checkout "$SRC_BRANCH"
+
+      - name: Run HotFix agent (Gemini)
+        id: gemini
+        if: steps.pick.outputs.provider == 'gemini' || steps.fallback.outputs.run == 'true'
+        uses: google-github-actions/run-gemini-cli@v0
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_model: ${{ vars.HOTFIX_GEMINI_MODEL }}
+          prompt: ${{ env.HOTFIX_GEMINI_PROMPT }}
+          settings: |
+            {
+              "model": { "maxSessionTurns": ${{ vars.HOTFIX_MAX_TURNS || '40' }} },
+              "tools": {
+                "core": [
+                  "read_file", "read_many_files", "write_file", "replace",
+                  "glob", "search_file_content", "list_directory", "run_shell_command"
+                ]
+              }
+            }
+
+      - name: Report status to Slack
+        if: always()
+        env:
+          CALLBACK_URL:   ${{ secrets.HOTFIX_CALLBACK_URL }}
+          CALLBACK_TOKEN: ${{ secrets.CALLBACK_TOKEN }}
+          PROVIDER: ${{ steps.fallback.outputs.run == 'true' && 'gemini (Claude fallback)' || steps.pick.outputs.provider }}
+          PICK_REASON: ${{ steps.pick.outputs.reason }}
+        run: |
+          set -e
+          BRANCH="$BRANCH_NAME"
+          PR_JSON=$(gh pr list --head "$BRANCH" --state open --json url,isDraft --limit 1 2>/dev/null || echo '[]')
+          PR_URL=$(echo "$PR_JSON" | jq -r '.[0].url // empty')
+          IS_DRAFT=$(echo "$PR_JSON" | jq -r '.[0].isDraft // empty')
+          if   [ -n "$PR_URL" ] && [ "$IS_DRAFT" = "true" ]; then STATUS="draft"
+          elif [ -n "$PR_URL" ]; then STATUS="pr_opened"
+          else STATUS="failed"; fi
+          SUMMARY="Fix attempted with ${PROVIDER} (${PICK_REASON})."
+          echo "Reporting status=$STATUS pr=$PR_URL provider=$PROVIDER"
+          if [ -z "$CALLBACK_URL" ] || [ -z "$CALLBACK_TOKEN" ]; then
+            echo "CALLBACK_URL or CALLBACK_TOKEN not set; skipping Slack status."; exit 0
+          fi
+          curl -sS -X POST "$CALLBACK_URL" \
+            -H "Authorization: Bearer ${CALLBACK_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg id "$ISSUE_ID" --arg s "$STATUS" --arg u "$PR_URL" \
+                  --arg e "$EXC" --arg c "$CLS" --arg m "$MTH" --arg sum "$SUMMARY" \
+                  '{issueId:$id, status:$s, prUrl:$u, exceptionType:$e, targetClass:$c, targetMethod:$m, summary:$sum}')"

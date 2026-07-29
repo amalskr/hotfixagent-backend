@@ -32,6 +32,14 @@ export interface HotFixConfig {
   maxAttemptsPerIssue: number;
   /** Dispatch policy (cost/noise control for high-traffic apps). */
   dispatchMode: "all" | "auto-only" | "notify-only";
+  /**
+   * Which LLM the repair agent runs on, sent to CI in the dispatch payload.
+   *  "auto"   – Claude, falling back to Gemini when the Anthropic API is out of
+   *             quota / rate limited (the workflow pre-checks before each run)
+   *  "claude" – always Claude
+   *  "gemini" – always Gemini
+   */
+  llmProvider: "auto" | "claude" | "gemini";
   /** HIGH-confidence crash types: localised, likely a single-file fix. Tune per app. */
   autoFixableTypes: string[];
   /** LOW-confidence crash types: systemic/environmental. Tune per app. */
@@ -69,6 +77,13 @@ export const config: HotFixConfig = {
   //  "notify-only" – never run the agent; Slack only (shadow / observe mode)
   // High-traffic app? Start "notify-only" (observe volume), then "auto-only".
   dispatchMode: "all",
+
+  // ─── LLM provider ───
+  // "auto" = Claude first, automatic switch to Gemini when the Anthropic API is
+  // over quota / rate limited. Pin to "gemini" (or "claude") to stop switching.
+  // The CI secrets ANTHROPIC_API_KEY / GEMINI_API_KEY decide what is available;
+  // "auto" with only one key set simply uses that one.
+  llmProvider: "auto",
 
   // Production apps are minified; if R8/ProGuard mapping deobfuscation is missing,
   // still treat obfuscated non-framework frames (e.g. "wq.h0") as app candidates.
